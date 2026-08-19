@@ -299,6 +299,202 @@ test('GET photo returns 404 when trying to get non-existent blob', async (t) => 
   }
 })
 
+test('GET photo advertises range support and content length', async (t) => {
+  const { data, server, projectPublicId } = await setup(t)
+
+  for (const { blobId, image } of data) {
+    const res = await server.inject({
+      method: 'GET',
+      url: buildRouteUrl({ ...blobId, projectPublicId }),
+    })
+
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.headers['accept-ranges'], 'bytes')
+    assert.equal(res.headers['content-length'], String(image.data.byteLength))
+  }
+})
+
+test('GET photo with a range returns that part of the blob', async (t) => {
+  const { data, server, projectPublicId } = await setup(t)
+
+  for (const { blobId, image } of data) {
+    const size = image.data.byteLength
+
+    /**
+     * `start` and `end` are the inclusive byte offsets we expect to be served.
+     * @type {Array<{ range: string, start: number, end: number }>}
+     */
+    const cases = [
+      { range: 'bytes=0-9', start: 0, end: 9 },
+      { range: 'bytes=10-19', start: 10, end: 19 },
+      // A range that runs to the end of the blob
+      { range: `bytes=10-${size - 1}`, start: 10, end: size - 1 },
+      // An open-ended range asks for everything from `start` onwards
+      { range: 'bytes=10-', start: 10, end: size - 1 },
+      { range: 'bytes=0-', start: 0, end: size - 1 },
+      // A suffix range asks for the final N bytes
+      { range: 'bytes=-10', start: size - 10, end: size - 1 },
+      // A single byte
+      { range: 'bytes=5-5', start: 5, end: 5 },
+      // An end beyond the blob is clamped to the last byte
+      { range: `bytes=10-${size + 100}`, start: 10, end: size - 1 },
+      // A suffix longer than the blob is clamped to the whole blob
+      { range: `bytes=-${size + 100}`, start: 0, end: size - 1 },
+    ]
+
+    for (const { range, start, end } of cases) {
+      const res = await server.inject({
+        method: 'GET',
+        url: buildRouteUrl({ ...blobId, projectPublicId }),
+        headers: { range },
+      })
+
+      assert.equal(res.statusCode, 206, `${range} is a partial response`)
+      assert.equal(
+        res.headers['content-range'],
+        `bytes ${start}-${end}/${size}`,
+        `${range} has the expected content range`
+      )
+      assert.equal(
+        res.headers['content-length'],
+        String(end - start + 1),
+        `${range} has the expected content length`
+      )
+      assert.deepEqual(
+        res.rawPayload,
+        image.data.subarray(start, end + 1),
+        `${range} has the expected payload`
+      )
+    }
+  }
+})
+
+test('GET photo with a range keeps the content type of the whole blob', async (t) => {
+  const { data, server, projectPublicId, blobStore } = await setup(t)
+
+  for (const { blobId, image } of data) {
+    const inferredRes = await server.inject({
+      method: 'GET',
+      url: buildRouteUrl({ ...blobId, projectPublicId }),
+      // Deliberately skip the start of the blob, where the magic bytes are
+      headers: { range: 'bytes=10-19' },
+    })
+
+    assert.equal(
+      inferredRes.headers['content-type'],
+      getImageMimeType(image.ext) || 'application/octet-stream'
+    )
+
+    const driveId = await blobStore.put(blobId, image.data, {
+      metadata: { mimeType: 'image/fake' },
+    })
+
+    const metadataRes = await server.inject({
+      method: 'GET',
+      url: buildRouteUrl({ ...blobId, projectPublicId, driveId }),
+      headers: { range: 'bytes=10-19' },
+    })
+
+    assert.equal(metadataRes.headers['content-type'], 'image/fake')
+  }
+})
+
+test('GET photo with an unsatisfiable range returns 416', async (t) => {
+  const { data, server, projectPublicId } = await setup(t)
+
+  for (const { blobId, image } of data) {
+    const size = image.data.byteLength
+
+    const ranges = [
+      // Starts at or beyond the end of the blob
+      `bytes=${size}-`,
+      `bytes=${size}-${size + 10}`,
+      `bytes=${size + 100}-${size + 200}`,
+      // A zero-length suffix cannot be satisfied
+      'bytes=-0',
+    ]
+
+    for (const range of ranges) {
+      const res = await server.inject({
+        method: 'GET',
+        url: buildRouteUrl({ ...blobId, projectPublicId }),
+        headers: { range },
+      })
+
+      assert.equal(res.statusCode, 416, `${range} is not satisfiable`)
+      assert.equal(
+        res.headers['content-range'],
+        `bytes */${size}`,
+        `${range} reports the blob size`
+      )
+    }
+  }
+})
+
+test('GET photo ignores range headers it does not support', async (t) => {
+  const { data, server, projectPublicId } = await setup(t)
+
+  for (const { blobId, image } of data) {
+    const ranges = [
+      // We only support a single range
+      'bytes=0-9, 20-29',
+      // Unknown range unit
+      'items=0-9',
+      // Malformed
+      'bytes=abc',
+      'bytes=-',
+      'bytes',
+      '',
+      // Inverted, so invalid rather than unsatisfiable
+      'bytes=5-2',
+    ]
+
+    for (const range of ranges) {
+      const res = await server.inject({
+        method: 'GET',
+        url: buildRouteUrl({ ...blobId, projectPublicId }),
+        headers: { range },
+      })
+
+      assert.equal(res.statusCode, 200, `"${range}" returns the whole blob`)
+      assert.equal(res.headers['content-range'], undefined)
+      assert.deepEqual(res.rawPayload, image.data)
+    }
+  }
+})
+
+test('GET photo with a range returns 404 for a missing blob', async (t) => {
+  const projectKey = randomBytes(32)
+  const { projectPublicId, blobStore } = await setup(t, { projectKey })
+
+  const blobId = /** @type {const} */ ({
+    type: 'photo',
+    variant: 'original',
+    name: 'test-file',
+  })
+
+  const driveId = await blobStore.put(
+    blobId,
+    await readFile(new URL(import.meta.url))
+  )
+  await blobStore.clear({ ...blobId, driveId })
+
+  const server = createServer({ blobStore, projectKey })
+
+  // A range starting at 0 and one starting part-way through the blob take
+  // different paths through Hyperblobs, so check both
+  for (const range of ['bytes=0-9', 'bytes=10-19']) {
+    const res = await server.inject({
+      method: 'GET',
+      url: buildRouteUrl({ ...blobId, projectPublicId, driveId }),
+      headers: { range },
+    })
+
+    assert.equal(res.statusCode, 404, `${range} is not found`)
+    assert.equal(res.headers['content-range'], undefined)
+  }
+})
+
 /**
  * @param {object} opts
  * @param {string} [opts.prefix]

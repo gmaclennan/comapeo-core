@@ -264,6 +264,12 @@ export const BlobNotFoundError = createErrorClass({
   status: 404,
 })
 
+export const RangeNotSatisfiableError = createErrorClass({
+  code: 'RANGE_NOT_SATISFIABLE_ERROR',
+  message: 'Range not satisfiable',
+  status: 416,
+})
+
 export const InvalidIconSizeError = createErrorClass({
   code: 'INVALID_ICON_SIZE_ERROR',
   message: '{value} is not a valid icon size',

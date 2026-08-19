@@ -9,6 +9,7 @@ import { ensureKnownError } from '../errors.js'
 import {
   BlobNotFoundError,
   BlobStoreEntryNotFoundError,
+  RangeNotSatisfiableError,
   UnsupportedVariantError,
 } from '../errors.js'
 import ensureError from 'ensure-error'
@@ -98,11 +99,28 @@ async function routes(fastify, options) {
         throw new BlobStoreEntryNotFoundError()
       }
 
-      const { metadata } = entry.value
+      const { metadata, blob } = entry.value
+      const blobLength = blob.byteLength
+
+      reply.header('Accept-Ranges', 'bytes')
+
+      const range = parseRange(request.headers.range, blobLength)
+
+      if (range === null) {
+        reply.code(416)
+        reply.header('Content-Range', `bytes */${blobLength}`)
+        throw new RangeNotSatisfiableError()
+      }
 
       let blobStream
       try {
-        blobStream = await blobStore.createReadStreamFromEntry(driveId, entry)
+        blobStream = await blobStore.createReadStreamFromEntry(driveId, entry, {
+          wait: false,
+          ...(range && {
+            start: range.start,
+            length: range.end - range.start + 1,
+          }),
+        })
       } catch (e) {
         reply.code(404)
         throw ensureKnownError(e)
@@ -145,9 +163,65 @@ async function routes(fastify, options) {
         reply.header('Content-Type', guessedMime || 'application/octet-stream')
       }
 
+      // Set these last, so that they are not left on an error response
+      if (range) {
+        reply.code(206)
+        reply.header(
+          'Content-Range',
+          `bytes ${range.start}-${range.end}/${blobLength}`
+        )
+        reply.header('Content-Length', range.end - range.start + 1)
+      } else {
+        reply.header('Content-Length', blobLength)
+      }
+
       return reply.send(blobStream)
     }
   )
+}
+
+const BYTES_RANGE_REGEX = /^bytes=(\d*)-(\d*)$/
+
+/**
+ * Parse a `Range` request header for a single range of bytes.
+ *
+ * Returns `undefined` if the whole blob should be sent: either no range was
+ * requested, or the request is one that [the spec allows a server to
+ * ignore][0] — an unknown range unit, a malformed or invalid range, or more
+ * than one range (which we don't support). Returns `null` if the requested
+ * range cannot be satisfied.
+ *
+ * [0]: https://www.rfc-editor.org/rfc/rfc9110#field.range
+ *
+ * @param {undefined | string} rangeHeader
+ * @param {number} size Size of the blob, in bytes
+ * @returns {undefined | null | { start: number, end: number }} `end` is inclusive
+ */
+function parseRange(rangeHeader, size) {
+  if (!rangeHeader) return undefined
+
+  const match = BYTES_RANGE_REGEX.exec(rangeHeader)
+  if (!match) return undefined
+  const [, firstPos, lastPos] = match
+
+  let start, end
+
+  if (firstPos === '') {
+    // A suffix range, e.g. `bytes=-100`, asks for the last 100 bytes
+    if (lastPos === '') return undefined
+    const suffixLength = Number(lastPos)
+    if (suffixLength === 0) return null
+    start = Math.max(0, size - suffixLength)
+    end = size - 1
+  } else {
+    start = Number(firstPos)
+    // An absent last position, e.g. `bytes=100-`, asks for the rest of the blob
+    end = lastPos === '' ? size - 1 : Math.min(Number(lastPos), size - 1)
+    // An inverted range, e.g. `bytes=5-2`, is invalid rather than unsatisfiable
+    if (start > end && start < size) return undefined
+  }
+
+  return start > end ? null : { start, end }
 }
 
 /**
