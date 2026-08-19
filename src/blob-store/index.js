@@ -286,7 +286,11 @@ export class BlobStore extends ReadyResource {
    * @param {number} [options.length] Number of bytes to read
    * @returns {Promise<Readable>}
    */
-  async createReadStreamFromEntry(driveId, entry, options = { wait: false }) {
+  async createReadStreamFromEntry(
+    driveId,
+    entry,
+    { wait = false, ...rest } = {}
+  ) {
     const drive = this.#getDrive(driveId)
     const blobs = await drive.getBlobs()
 
@@ -294,7 +298,7 @@ export class BlobStore extends ReadyResource {
       throw new BlobsNotFoundError({ driveId: driveId.slice(0, 7) })
     }
 
-    return blobs.createReadStream(entry.value.blob, options)
+    return blobs.createReadStream(entry.value.blob, { wait, ...rest })
   }
 
   /**

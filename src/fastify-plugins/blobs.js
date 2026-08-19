@@ -63,6 +63,13 @@ async function blobServerPlugin(fastify, options) {
 async function routes(fastify, options) {
   const { getBlobStore } = options
 
+  // `Content-Range` is only meaningful on a 206 or a 416. A blob stream can
+  // fail after we have set it, so make sure it never ends up on any other
+  // response.
+  fastify.addHook('onError', async (_request, reply) => {
+    if (reply.statusCode !== 416) reply.removeHeader('Content-Range')
+  })
+
   fastify.get(
     '/:projectPublicId/:driveId/:type/:variant/:name',
     { schema: { params: PARAMS_JSON_SCHEMA } },
@@ -101,26 +108,46 @@ async function routes(fastify, options) {
 
       const { metadata, blob } = entry.value
       const blobLength = blob.byteLength
+      const metadataMimeType = getMetadataMimeType(metadata)
 
       reply.header('Accept-Ranges', 'bytes')
 
       const range = parseRange(request.headers.range, blobLength)
 
+      // `null` means the requested range cannot be satisfied
       if (range === null) {
         reply.code(416)
         reply.header('Content-Range', `bytes */${blobLength}`)
         throw new RangeNotSatisfiableError()
       }
 
+      if (range) {
+        reply.code(206)
+        reply.header(
+          'Content-Range',
+          `bytes ${range.start}-${range.end}/${blobLength}`
+        )
+        reply.header('Content-Length', range.end - range.start + 1)
+      } else {
+        reply.header('Content-Length', blobLength)
+      }
+
+      // An empty blob has no blocks to read, so there is no stream to wait on
+      if (blobLength === 0) {
+        reply.header(
+          'Content-Type',
+          metadataMimeType || 'application/octet-stream'
+        )
+        return reply.send('')
+      }
+
       let blobStream
       try {
-        blobStream = await blobStore.createReadStreamFromEntry(driveId, entry, {
-          wait: false,
-          ...(range && {
-            start: range.start,
-            length: range.end - range.start + 1,
-          }),
-        })
+        blobStream = await blobStore.createReadStreamFromEntry(
+          driveId,
+          entry,
+          range && { start: range.start, length: range.end - range.start + 1 }
+        )
       } catch (e) {
         reply.code(404)
         throw ensureKnownError(e)
@@ -139,40 +166,19 @@ async function routes(fastify, options) {
         }
       }
 
-      // Extract the 'mimeType' property of the metadata and use it for the response header if found
-      if (
-        metadata &&
-        typeof metadata === 'object' &&
-        'mimeType' in metadata &&
-        typeof metadata.mimeType === 'string'
-      ) {
-        reply.header('Content-Type', metadata.mimeType)
+      if (metadataMimeType) {
+        reply.header('Content-Type', metadataMimeType)
       } else {
-        // Attempt to guess the MIME type based on the blob contents
+        // Attempt to guess the MIME type from the bytes at the start of the
+        // blob. Those bytes may not have been downloaded, even when the bytes
+        // we are serving have been, so fall back rather than failing.
         const blobSlice = await blobStore.getEntryBlob(driveId, entry, {
-          length: 20,
+          length: Math.min(20, blobLength),
         })
 
-        if (!blobSlice) {
-          reply.code(404)
-          throw new BlobNotFoundError()
-        }
-
-        const [guessedMime] = filetypemime(blobSlice)
+        const [guessedMime] = blobSlice ? filetypemime(blobSlice) : []
 
         reply.header('Content-Type', guessedMime || 'application/octet-stream')
-      }
-
-      // Set these last, so that they are not left on an error response
-      if (range) {
-        reply.code(206)
-        reply.header(
-          'Content-Range',
-          `bytes ${range.start}-${range.end}/${blobLength}`
-        )
-        reply.header('Content-Length', range.end - range.start + 1)
-      } else {
-        reply.header('Content-Length', blobLength)
       }
 
       return reply.send(blobStream)
@@ -180,7 +186,23 @@ async function routes(fastify, options) {
   )
 }
 
-const BYTES_RANGE_REGEX = /^bytes=(\d*)-(\d*)$/
+/**
+ * @param {unknown} metadata
+ * @returns {undefined | string}
+ */
+function getMetadataMimeType(metadata) {
+  if (
+    metadata &&
+    typeof metadata === 'object' &&
+    'mimeType' in metadata &&
+    typeof metadata.mimeType === 'string'
+  ) {
+    return metadata.mimeType
+  }
+}
+
+// Range units are case-insensitive
+const BYTES_RANGE_REGEX = /^bytes=(\d*)-(\d*)$/i
 
 /**
  * Parse a `Range` request header for a single range of bytes.
@@ -216,9 +238,10 @@ function parseRange(rangeHeader, size) {
   } else {
     start = Number(firstPos)
     // An absent last position, e.g. `bytes=100-`, asks for the rest of the blob
-    end = lastPos === '' ? size - 1 : Math.min(Number(lastPos), size - 1)
+    const lastBytePos = lastPos === '' ? size - 1 : Number(lastPos)
     // An inverted range, e.g. `bytes=5-2`, is invalid rather than unsatisfiable
-    if (start > end && start < size) return undefined
+    if (lastPos !== '' && lastBytePos < start) return undefined
+    end = Math.min(lastBytePos, size - 1)
   }
 
   return start > end ? null : { start, end }
