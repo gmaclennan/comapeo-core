@@ -282,9 +282,15 @@ export class BlobStore extends ReadyResource {
    * @param {import('hyperdrive').HyperdriveEntry} entry Hyperdrive entry
    * @param {object} [options]
    * @param {boolean} [options.wait=false] Set to `true` to wait for a blob to download, otherwise will throw if blob is not available locally
+   * @param {number} [options.start] Byte offset within the blob to start reading from
+   * @param {number} [options.length] Number of bytes to read
    * @returns {Promise<Readable>}
    */
-  async createReadStreamFromEntry(driveId, entry, options = { wait: false }) {
+  async createReadStreamFromEntry(
+    driveId,
+    entry,
+    { wait = false, ...rest } = {}
+  ) {
     const drive = this.#getDrive(driveId)
     const blobs = await drive.getBlobs()
 
@@ -292,7 +298,7 @@ export class BlobStore extends ReadyResource {
       throw new BlobsNotFoundError({ driveId: driveId.slice(0, 7) })
     }
 
-    return blobs.createReadStream(entry.value.blob, options)
+    return blobs.createReadStream(entry.value.blob, { wait, ...rest })
   }
 
   /**

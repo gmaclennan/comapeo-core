@@ -186,6 +186,109 @@ test('retrieving blobs using url', async (t) => {
   await exceptionPromise2
 })
 
+test('retrieving part of a blob using a range request', async (t) => {
+  const clock = FakeTimers.install({ shouldAdvanceTime: true })
+  t.after(() => clock.uninstall())
+
+  const fastify = Fastify()
+  const fastifyController = new FastifyController({ fastify })
+  t.after(() => fastifyController.stop())
+
+  const { dbFolder, coreStorage } = makeManagerStorage(t)
+
+  const manager = new MapeoManager({
+    rootKey: KeyManager.generateRootKey(),
+    projectMigrationsFolder,
+    clientMigrationsFolder,
+    dbFolder,
+    coreStorage,
+    fastify,
+  })
+
+  const project = await manager.getProject(await manager.createProject())
+
+  fastifyController.start()
+
+  const blobId = await project.$blobs.create(
+    { original: join(BLOB_FIXTURES_DIR, 'original.png') },
+    { mimeType: 'image/png' }
+  )
+  const blobUrl = await project.$blobs.getUrl({
+    ...blobId,
+    variant: 'original',
+  })
+  const expected = await fs.readFile(join(BLOB_FIXTURES_DIR, 'original.png'))
+  const size = expected.byteLength
+
+  await t.test('a range in the middle of the blob', async () => {
+    const response = await fetch(blobUrl, { headers: { Range: 'bytes=10-19' } })
+
+    assert.equal(response.status, 206, 'response is a partial response')
+    assert.equal(
+      response.headers.get('content-range'),
+      `bytes 10-19/${size}`,
+      'matching content range header'
+    )
+    assert.equal(
+      response.headers.get('content-length'),
+      '10',
+      'matching content length header'
+    )
+    assert.equal(
+      response.headers.get('content-type'),
+      'image/png',
+      'content type of the whole blob'
+    )
+    assert.deepEqual(
+      Buffer.from(await response.arrayBuffer()),
+      expected.subarray(10, 20),
+      'matching response body'
+    )
+  })
+
+  await t.test('the tail of the blob', async () => {
+    const response = await fetch(blobUrl, { headers: { Range: 'bytes=-100' } })
+
+    assert.equal(response.status, 206, 'response is a partial response')
+    assert.equal(
+      response.headers.get('content-range'),
+      `bytes ${size - 100}-${size - 1}/${size}`,
+      'matching content range header'
+    )
+    assert.deepEqual(
+      Buffer.from(await response.arrayBuffer()),
+      expected.subarray(size - 100),
+      'matching response body'
+    )
+  })
+
+  await t.test('a whole blob response advertises range support', async () => {
+    const response = await fetch(blobUrl)
+
+    assert.equal(response.status, 200, 'response status ok')
+    assert.equal(response.headers.get('accept-ranges'), 'bytes')
+    assert.equal(response.headers.get('content-length'), String(size))
+    assert.deepEqual(
+      Buffer.from(await response.arrayBuffer()),
+      expected,
+      'matching response body'
+    )
+  })
+
+  await t.test('a range beyond the end of the blob', async () => {
+    const response = await fetch(blobUrl, {
+      headers: { Range: `bytes=${size}-` },
+    })
+
+    assert.equal(response.status, 416, 'response is not satisfiable')
+    assert.equal(
+      response.headers.get('content-range'),
+      `bytes */${size}`,
+      'matching content range header'
+    )
+  })
+})
+
 test('retrieving icons using url', async (t) => {
   const clock = FakeTimers.install({ shouldAdvanceTime: true })
   t.after(() => clock.uninstall())
