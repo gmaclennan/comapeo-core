@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { KeyManager } from '@mapeo/crypto'
 
+import { TypedEmitter } from 'tiny-typed-emitter'
 import { MemberApi } from '../src/member-api.js'
 import { LocalPeers } from '../src/local-peers.js'
 import { MEMBER_ROLE_ID, ROLES } from '../src/roles.js'
@@ -266,6 +267,29 @@ class MockRoles {
 }
 
 /**
+ * Mock of the part of RemoteDiscovery that MemberApi uses: every peer is
+ * connected and admission always succeeds.
+ * @extends {TypedEmitter<{ 'peer-closed': (deviceId: string) => void }>}
+ */
+class MockRemoteDiscovery extends TypedEmitter {
+  /**
+   * @param {string} _deviceId
+   * @param {Buffer} _inviteId
+   */
+  async admit(_deviceId, _inviteId) {
+    return true
+  }
+  /**
+   * @param {string} _deviceId
+   * @param {Buffer} _inviteId
+   * @param {import('../src/generated/invite-link.js').Deny['reason']} _reason
+   */
+  async deny(_deviceId, _inviteId, _reason) {}
+  /** @param {string} _publicKey */
+  async disconnectPeer(_publicKey) {}
+}
+
+/**
  * In-memory mock of InviteLinksApi for testing
  */
 class MockInviteLinksApiForProject {
@@ -336,8 +360,7 @@ class MockInviteLinksApiForProject {
  * @param {(url: string) => WebSocket} [opts.makeWebsocket]
  * @param {() => import('../src/types.js').ReplicationStream} [opts.getReplicationStream]
  * @param {(deviceId: string, abortSignal: AbortSignal) => Promise<void>} [opts.waitForInitialSyncWithPeer]
- * @param {(deviceId: string) => Promise<boolean>} [opts.markInternetPeerAsTrusted]
- * @param {(deviceId: string) => Promise<void>} [opts.disconnectFromPeer]
+ * @param {MockRemoteDiscovery} [opts.remoteDiscovery]
  * @param {() => Promise<import('../src/mapeo-project.js').EditableProjectSettings>} [opts.getProjectSettings]
  * @param {(deviceId: string) => Promise<import('../src/member-api.js').MemberDeviceInfo>} [opts.getDeviceInfo]
  * @param {(deviceId: string, deviceInfo: import('../src/member-api.js').NewDeviceInfo) => Promise<void>} [opts.setDeviceInfo]
@@ -356,14 +379,13 @@ function setup({
     }),
   setDeviceInfo = () => Promise.reject(new Error('Not implemented')),
   waitForInitialSyncWithPeer = () => Promise.resolve(),
-  disconnectFromPeer = () => Promise.resolve(),
+  remoteDiscovery = new MockRemoteDiscovery(),
   makeWebsocket = () => {
     throw new Error('Not implemented')
   },
   getReplicationStream = () => {
     throw new Error('Not implemented')
   },
-  markInternetPeerAsTrusted = () => Promise.resolve(true),
   inviteLinks,
 } = {}) {
   const keyManager = new KeyManager(rootKey)
@@ -390,8 +412,7 @@ function setup({
     makeWebsocket,
     getReplicationStream,
     waitForInitialSyncWithPeer,
-    disconnectFromPeer,
-    markInternetPeerAsTrusted,
+    remoteDiscovery,
     getProjectSettings,
     getDeviceInfo,
     setDeviceInfo,

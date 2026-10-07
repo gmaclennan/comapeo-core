@@ -2,10 +2,8 @@ import * as b4a from 'b4a'
 import * as crypto from 'node:crypto'
 import WebSocket from 'ws'
 import { pEvent } from 'p-event'
-import {
-  InviteResponse_Decision,
-  DenyInviteOverInternet_DenyReason,
-} from './generated/rpc.js'
+import { InviteResponse_Decision } from './generated/rpc.js'
+import { Deny_DenyReason } from './generated/invite-link.js'
 import {
   noop,
   projectKeyToProjectInviteId,
@@ -36,6 +34,9 @@ import {
   AlreadyInvitingError,
   InvalidResponseBodyError,
   RPCDisconnectBeforeAckError,
+  RPCDisconnectBeforeSendingError,
+  UnknownPeerError,
+  PeerDisconnectedError,
   InvalidInternetInviteURLError,
   InviteAlreadyRedeemedError,
   InviteNotYetRedeemedError,
@@ -64,6 +65,16 @@ export const kHandleRedeemInviteOverInternet = Symbol(
 )
 
 /**
+ * Errors from the RPC layer that mean the peer went away
+ * @type {Set<string>}
+ */
+const PEER_GONE_ERROR_CODES = new Set([
+  PeerDisconnectedError.code,
+  UnknownPeerError.code,
+  RPCDisconnectBeforeSendingError.code,
+])
+
+/**
  * @import {
  *   DeviceInfo,
  *   DeviceInfoValue,
@@ -72,6 +83,7 @@ export const kHandleRedeemInviteOverInternet = Symbol(
  * } from '@comapeo/schema'
  */
 /** @import { Invite, InviteResponse } from './generated/rpc.js' */
+/** @import { RemoteDiscovery } from './discovery/remote-discovery.js' */
 /** @import { DataType } from './datatype/index.js' */
 /** @import { DataStore } from './datastore/index.js' */
 /** @import { deviceInfoTable } from './schema/project.js' */
@@ -134,6 +146,18 @@ export const kHandleRedeemInviteOverInternet = Symbol(
  */
 
 /**
+ * The part of RemoteDiscovery that member management needs: admitting or
+ * denying a peer that redeemed an invite link, disconnecting it, and hearing
+ * when its connection closes.
+ * @typedef {object} MemberRemoteDiscovery
+ * @property {RemoteDiscovery['admit']} admit
+ * @property {RemoteDiscovery['deny']} deny
+ * @property {RemoteDiscovery['disconnectPeer']} disconnectPeer
+ * @property {(event: 'peer-closed', listener: (deviceId: string) => void) => unknown} on
+ * @property {(event: 'peer-closed', listener: (deviceId: string) => void) => unknown} off
+ */
+
+/**
  * @typedef {object} MemberEvents
  */
 
@@ -149,8 +173,7 @@ export class MemberApi extends TypedEmitter {
   #makeWebsocket
   #getReplicationStream
   #waitForInitialSyncWithPeer
-  #markInternetPeerAsTrusted
-  #disconnectFromPeer
+  #remoteDiscovery
   #getProjectSettings
   #getDeviceInfo
   #setDeviceInfo
@@ -177,8 +200,7 @@ export class MemberApi extends TypedEmitter {
    * @param {(url: string) => WebSocket} [opts.makeWebsocket]
    * @param {() => ReplicationStream} opts.getReplicationStream
    * @param {(deviceId: string, abortSignal: AbortSignal) => Promise<void>} opts.waitForInitialSyncWithPeer
-   * @param {(deviceId: string) => Promise<boolean>} opts.markInternetPeerAsTrusted
-   * @param {(deviceId: string) => Promise<void>} opts.disconnectFromPeer
+   * @param {MemberRemoteDiscovery} opts.remoteDiscovery
    * @param {() => Promise<import('./mapeo-project.js').EditableProjectSettings>} opts.getProjectSettings
    * @param {(deviceId: string) => Promise<MemberDeviceInfo>} opts.getDeviceInfo
    * @param {(deviceId: string, deviceInfo: NewDeviceInfo) => Promise<void>} opts.setDeviceInfo
@@ -194,8 +216,7 @@ export class MemberApi extends TypedEmitter {
     makeWebsocket = (url) => new WebSocket(url),
     getReplicationStream,
     waitForInitialSyncWithPeer,
-    markInternetPeerAsTrusted,
-    disconnectFromPeer,
+    remoteDiscovery,
     getProjectSettings,
     getDeviceInfo,
     setDeviceInfo,
@@ -213,18 +234,19 @@ export class MemberApi extends TypedEmitter {
     this.#makeWebsocket = makeWebsocket
     this.#getReplicationStream = getReplicationStream
     this.#waitForInitialSyncWithPeer = waitForInitialSyncWithPeer
-    this.#markInternetPeerAsTrusted = markInternetPeerAsTrusted
-    this.#disconnectFromPeer = disconnectFromPeer
+    this.#remoteDiscovery = remoteDiscovery
     this.#getProjectSettings = getProjectSettings
     this.#getDeviceInfo = getDeviceInfo
     this.#setDeviceInfo = setDeviceInfo
     this.#getSwarmPublicKey = getSwarmPublicKey
 
     this.#rpc.on('peer-remove', this.#handlePeerRemove)
+    this.#remoteDiscovery.on('peer-closed', this.#handleRemotePeerClosed)
   }
 
   async close() {
     this.#rpc.removeListener('peer-remove', this.#handlePeerRemove)
+    this.#remoteDiscovery.off('peer-closed', this.#handleRemotePeerClosed)
   }
 
   /**
@@ -311,12 +333,24 @@ export class MemberApi extends TypedEmitter {
    * When a peer disconnects, remove them from the redeemed invites set.
    * @param {PeerInfoDisconnected} peer
    */
-  #handlePeerRemove = async (peer) => {
+  #handlePeerRemove = (peer) => {
     if (!peer) return
+    this.#clearRedeemedByDevice(peer.deviceId)
+  }
+
+  /**
+   * A remote peer that redeemed an invite link but was not yet admitted is
+   * never seen by the RPC layer, so its disconnect arrives from discovery.
+   * @param {string} deviceId
+   */
+  #handleRemotePeerClosed = (deviceId) => {
+    this.#clearRedeemedByDevice(deviceId)
+  }
+
+  /** @param {string} deviceId */
+  #clearRedeemedByDevice(deviceId) {
     for (const deviceIds of this.#redeemedInvites.values()) {
-      if (deviceIds.has(peer.deviceId)) {
-        deviceIds.delete(peer.deviceId)
-      }
+      deviceIds.delete(deviceId)
     }
   }
 
@@ -335,7 +369,7 @@ export class MemberApi extends TypedEmitter {
         'Incoming invite was already redeemed, disconnecting',
         inviteIdString.slice(0, 7)
       )
-      await this.#disconnectFromPeer(peerId)
+      await this.#remoteDiscovery.disconnectPeer(peerId)
 
       throw new InviteAlreadyRedeemedError()
     }
@@ -365,9 +399,15 @@ export class MemberApi extends TypedEmitter {
       throw new UnknownInviteIDError()
     }
 
-    const stillConnected = await this.#markInternetPeerAsTrusted(deviceId)
+    // Admitting opens the RPC channel with the peer, over which the regular
+    // invite flow then runs
+    const stillConnected = await this.#remoteDiscovery.admit(
+      deviceId,
+      Buffer.from(inviteId, 'hex')
+    )
 
     if (!stillConnected) {
+      redeemedSet.delete(deviceId)
       throw new PeerDisconnectedSinceRedeemingInviteError()
     }
     const { roleId, roleName, roleDescription } = pendingInvite
@@ -380,8 +420,15 @@ export class MemberApi extends TypedEmitter {
       })
       return decision
     } catch (e) {
-      await this.#disconnectFromPeer(deviceId)
-      throw e
+      await this.#remoteDiscovery.disconnectPeer(deviceId)
+      // The peer can disconnect at any point between redeeming and the invite
+      // being sent; surface that as one error regardless of which layer
+      // noticed first
+      const err = ensureKnownError(e)
+      if (PEER_GONE_ERROR_CODES.has(err.code)) {
+        throw new PeerDisconnectedSinceRedeemingInviteError({ cause: err })
+      }
+      throw err
     }
   }
 
@@ -389,13 +436,13 @@ export class MemberApi extends TypedEmitter {
    * Deny a specific device's attempt at redeeming an invite.
    * @param {string} inviteId
    * @param {string} deviceId
-   * @param {DenyInviteOverInternet_DenyReason} [reason] Reason for denying the request
+   * @param {Deny_DenyReason} [reason] Reason for denying the request
    * @returns {Promise<void>}
    */
   async denyInviteLinkRequest(
     inviteId,
     deviceId,
-    reason = DenyInviteOverInternet_DenyReason.invitor_denied
+    reason = Deny_DenyReason.invitor_denied
   ) {
     const redeemedSet = this.#redeemedInvites.get(inviteId)
     if (!redeemedSet || !redeemedSet.has(deviceId)) {
@@ -407,16 +454,12 @@ export class MemberApi extends TypedEmitter {
       throw new UnknownInviteIDError()
     }
 
-    try {
-      await this.#rpc.sendDenyInviteOverInternet(deviceId, {
-        inviteId: Buffer.from(inviteId, 'hex'),
-        reason,
-      })
-    } catch {
-      // RPC may fail if the peer disconnected, that's ok
-    }
-
-    await this.#disconnectFromPeer(deviceId)
+    // Sends the deny, waits for the peer to acknowledge it, and disconnects
+    await this.#remoteDiscovery.deny(
+      deviceId,
+      Buffer.from(inviteId, 'hex'),
+      reason
+    )
   }
 
   /**

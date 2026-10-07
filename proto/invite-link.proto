@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+import "rpc.proto";
+
+// Messages for the `comapeo/invite-link` channel, which is opened on a remote
+// connection after the identity handshake and before the RPC channel. This is
+// the only protocol an un-admitted remote peer can speak.
+
+// Invitee -> invitor: request admission with an invite link ID
+message Redeem {
+  bytes inviteId = 1;
+  // Display info so the invitor can show who is asking before deciding
+  string deviceName = 2;
+  DeviceInfo.DeviceType deviceType = 3;
+}
+
+// Invitor -> invitee: the redeem request was received and is awaiting a decision
+message RedeemAck {
+  bytes inviteId = 1;
+}
+
+// Invitor -> invitee: admission granted, both sides open the RPC channel
+message Admit {
+  bytes inviteId = 1;
+}
+
+// Invitor -> invitee: admission refused
+message Deny {
+  enum DenyReason {
+    unspecified = 0;
+    unknown_invite_id = 1;
+    invitor_denied = 2;
+  }
+  bytes inviteId = 1;
+  DenyReason reason = 2;
+}
+
+// Invitee -> invitor: the deny was received, the invitor may now close
+message DenyAck {
+  bytes inviteId = 1;
+}

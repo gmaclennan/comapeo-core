@@ -13,8 +13,8 @@ import { parseInviteURL } from '../src/invite/invite-urls.js'
 
 /**
  * Create a minimal "fake peer" that can connect to a MapeoManager over
- * remote discovery, exchange device info, and send RPC messages.
- * It does NOT create a project or sync any cores.
+ * remote discovery, redeem an invite link, and (once admitted) exchange RPC
+ * messages. It does NOT create a project or sync any cores.
  *
  * @param {import('hyperdht/testnet.js').TestNet} testnet
  * @param {number} nodeIndex Which testnet node to use
@@ -23,7 +23,7 @@ import { parseInviteURL } from '../src/invite/invite-urls.js'
  *   remoteDiscovery: RemoteDiscovery,
  *   deviceId: string,
  *   connect: (swarmPublicKey: string) => Promise<void>,
- *   sendRedeem: (deviceId: string, inviteId: Buffer) => Promise<void>,
+ *   sendRedeem: (inviteId: Buffer) => Promise<void>,
  *   acceptInvite: (peerId: string, inviteId: Buffer) => Promise<void>,
  *   close: () => Promise<void>,
  * }>}
@@ -42,23 +42,33 @@ async function createFakePeer(testnet, nodeIndex) {
 
   const localPeers = new LocalPeers()
 
-  // Wire up: when remote discovery gets a connection, hand it to localPeers
+  // Wire up: only admitted connections are emitted, hand those to localPeers
   remoteDiscovery.on('connection', (noiseStream) => {
-    localPeers.connect(noiseStream, noiseStream.isTrusted)
+    localPeers.connect(noiseStream)
   })
+
+  /** @type {import('../src/discovery/remote-discovery.js').RemoteAuthedNoiseStream | null} */
+  let connection = null
 
   /** @param {string} swarmPublicKey Hex-encoded swarm public key to connect to */
   async function connect(swarmPublicKey) {
-    await remoteDiscovery.connectPeer(swarmPublicKey, { timeout: 5000 })
+    connection = await remoteDiscovery.connectPeer(swarmPublicKey, {
+      timeout: 5000,
+    })
   }
 
   /**
-   * Send a RedeemInviteOverInternet message to the given peer.
-   * @param {string} peerDeviceId The device ID (noise key hex) of the peer
+   * Redeem an invite link on the invite-link channel. Resolves once the
+   * invitor has acknowledged the request.
    * @param {Buffer} inviteId
    */
-  async function sendRedeem(peerDeviceId, inviteId) {
-    await localPeers.sendRedeemInviteOverInternet(peerDeviceId, { inviteId })
+  async function sendRedeem(inviteId) {
+    if (!connection) throw new Error('Not connected')
+    await remoteDiscovery.redeem(connection, {
+      inviteId,
+      deviceName: 'fake peer',
+      deviceType: 'mobile',
+    })
   }
 
   /**
@@ -93,7 +103,7 @@ async function createFakePeer(testnet, nodeIndex) {
   }
 }
 
-test('discovery keys flow to peer only after trust', async (t) => {
+test('discovery keys flow to peer only after admission', async (t) => {
   const testnet = await createTestnet(2)
   t.after(() => testnet.destroy())
 
@@ -132,11 +142,11 @@ test('discovery keys flow to peer only after trust', async (t) => {
   const { swarmPublicKey } = parseInviteURL(url)
   await fakePeer.connect(swarmPublicKey)
 
-  // Before trust: no discovery keys should have been sent
+  // Before admission: no discovery keys should have been sent
   assert.equal(
     discoveryKeys.length,
     0,
-    'no discovery keys sent to untrusted peer'
+    'no discovery keys sent to un-admitted peer'
   )
 
   // Set up to catch the invite-link-join-request event
@@ -146,7 +156,7 @@ test('discovery keys flow to peer only after trust', async (t) => {
   })
 
   // Fake peer sends the redeem request
-  await fakePeer.sendRedeem(manager.deviceId, Buffer.from(inviteId, 'hex'))
+  await fakePeer.sendRedeem(Buffer.from(inviteId, 'hex'))
 
   // Manager detected the redeem attempt
   /** @type {[string, string, string]} */
@@ -155,7 +165,7 @@ test('discovery keys flow to peer only after trust', async (t) => {
   )
   assert.equal(deviceId, fakePeer.deviceId)
 
-  // Now accept the invite - this triggers trustPeer() which triggers replicate()
+  // Now accept the invite - this admits the peer, which triggers replicate()
   // The invite will fail initial sync (fake peer has no project), but we don't care
   const acceptPromise = project.$member
     .acceptInviteLinkRequest(redeemInviteId, deviceId)
@@ -167,7 +177,7 @@ test('discovery keys flow to peer only after trust', async (t) => {
   // We should have received at least one discovery key (the creator core)
   assert.ok(
     discoveryKeys.length >= 1,
-    `expected at least 1 discovery key after trust, got ${discoveryKeys.length}`
+    `expected at least 1 discovery key after admission, got ${discoveryKeys.length}`
   )
 
   // Let the accept promise settle (it will fail with InitialSyncFailedError)
@@ -219,14 +229,14 @@ test('discovery key received matches project creator core', async (t) => {
 
   await fakePeer.connect(swarmPublicKey)
 
-  assert.equal(receivedKeys.length, 0, 'no discovery keys before trust')
+  assert.equal(receivedKeys.length, 0, 'no discovery keys before admission')
 
   const onRedeemAttempt = pEvent(manager, 'invite-link-join-request', {
     multiArgs: true,
     timeout: 5000,
   })
 
-  await fakePeer.sendRedeem(manager.deviceId, Buffer.from(inviteId, 'hex'))
+  await fakePeer.sendRedeem(Buffer.from(inviteId, 'hex'))
   /** @type {[string, string, string]} */
   const [, deviceId2, redeemInviteId2] = /** @type {any} */ (
     await onRedeemAttempt

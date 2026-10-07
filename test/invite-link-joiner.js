@@ -4,13 +4,22 @@ import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { Transform } from 'streamx'
 import { pEvent } from 'p-event'
+import pDefer from 'p-defer'
 
 import { InviteLinkJoiner } from '../src/invite/invite-link-joiner.js'
 import { makeInviteURL } from '../src/invite/invite-urls.js'
 import { MEMBER_ROLE_ID } from '../src/roles.js'
+import {
+  InviteConnectionError,
+  InviteDeniedByInviterError,
+  InviteRedeemConnectionClosedError,
+  JoinProjectCancelledError,
+} from '../src/errors.js'
 
 /** @import { RemoteAuthedNoiseStream } from '../src/discovery/remote-discovery.js' */
 /** @import { Invite, InviteApi } from '../src/invite/invite-api.js' */
+/** @import { JoinerDiscovery, JoinRequestUpdate } from '../src/invite/invite-link-joiner.js' */
+/** @import { Redeem } from '../src/generated/invite-link.js' */
 
 /**
  * @param {Buffer} authenticatedPublicKey
@@ -21,22 +30,16 @@ function mockConnection(authenticatedPublicKey) {
     /** @type {unknown} */ (new Transform())
   )
   connection.authenticatedPublicKey = authenticatedPublicKey
-  connection.isTrusted = true
   connection.remotePublicKey = randomBytes(32)
   return connection
 }
-
-/**
- * @typedef {object} MockInviteApiOptions
- * @property {string} [projectId] Project ID returned by accept (default: random)
- */
 
 class MockInviteApi extends TypedEmitter {
   /** @type {string} */
   #projectId
 
   /**
-   * @param {MockInviteApiOptions} [opts]
+   * @param {{ projectId?: string }} [opts]
    */
   constructor({ projectId = randomBytes(20).toString('hex') } = {}) {
     super()
@@ -52,12 +55,75 @@ class MockInviteApi extends TypedEmitter {
   }
 }
 
-test('happy path: connect, redeem, accept, complete', async () => {
-  const swarmPublicKey = randomBytes(32)
-  const authenticatedPublicKey = randomBytes(32)
-  const inviteId = randomBytes(32)
-  const projectId = randomBytes(20).toString('hex')
-  const url = makeInviteURL({
+/**
+ * A scripted stand-in for RemoteDiscovery: records calls and lets the test
+ * control when the invitor acks the redeem and when it admits or denies.
+ *
+ * @param {RemoteAuthedNoiseStream} connection
+ */
+function mockDiscovery(connection) {
+  /** @type {string[]} */
+  const connectCalls = []
+  /** @type {string[]} */
+  const disconnectCalls = []
+  /** @type {string[]} */
+  const leaveCalls = []
+  /** @type {Redeem[]} */
+  const redeemCalls = []
+  const redeemAcked = pDefer()
+  const admission = pDefer()
+  // The test may never settle these
+  redeemAcked.promise.catch(() => {})
+  admission.promise.catch(() => {})
+
+  /** @type {JoinerDiscovery} */
+  const discovery = {
+    async connectPeer(swarmPublicKeyHex) {
+      connectCalls.push(swarmPublicKeyHex)
+      return connection
+    },
+    async redeem(_connection, redeem) {
+      redeemCalls.push(redeem)
+      await redeemAcked.promise
+    },
+    async waitForAdmission(_connection, { signal } = {}) {
+      signal?.throwIfAborted()
+      await Promise.race([
+        admission.promise,
+        new Promise((_, reject) =>
+          signal?.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          })
+        ),
+      ])
+    },
+    async disconnectPeer(publicKeyHex) {
+      disconnectCalls.push(publicKeyHex)
+    },
+    leavePeer(swarmPublicKeyHex) {
+      leaveCalls.push(swarmPublicKeyHex)
+    },
+  }
+
+  return {
+    discovery,
+    connectCalls,
+    disconnectCalls,
+    leaveCalls,
+    redeemCalls,
+    ackRedeem: () => redeemAcked.resolve(),
+    admit: () => admission.resolve(),
+    /** @param {Error} err */
+    deny: (err) => admission.reject(err),
+  }
+}
+
+/**
+ * @param {Buffer} inviteId
+ * @param {Buffer} swarmPublicKey
+ */
+function testUrl(inviteId, swarmPublicKey) {
+  return makeInviteURL({
     inviteIdString: inviteId.toString('hex'),
     swarmPublicKey: swarmPublicKey.toString('hex'),
     invitorName: 'invitor',
@@ -65,101 +131,199 @@ test('happy path: connect, redeem, accept, complete', async () => {
     expiresAt: Date.now() + 60_000,
     roleId: MEMBER_ROLE_ID,
   })
+}
 
-  const connection = mockConnection(authenticatedPublicKey)
+/**
+ * @param {InviteLinkJoiner} joiner
+ * @param {JoinRequestUpdate['status']} status
+ */
+function onStatus(joiner, status) {
+  return pEvent(joiner, 'join-request-update', {
+    timeout: 1000,
+    filter: (update) => update.status === status,
+  })
+}
+
+test('happy path: connect, redeem, acked, admitted, invited, complete', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const invitorIdentity = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const projectId = randomBytes(20).toString('hex')
+  const url = testUrl(inviteId, swarmPublicKey)
+
+  const connection = mockConnection(invitorIdentity)
   const inviteApi = new MockInviteApi({ projectId })
-
-  /** @type {string[]} */
-  const connectCalls = []
-  /** @type {string[]} */
-  const disconnectCalls = []
-  /** @type {[string, { inviteId: Buffer }][]} */
-  const redeemCalls = []
+  const mock = mockDiscovery(connection)
 
   const joiner = new InviteLinkJoiner({
-    connectPeer: async (swarmPublicKeyHex) => {
-      connectCalls.push(swarmPublicKeyHex)
-      return connection
-    },
-    disconnectPeer: async (swarmPublicKeyHex) => {
-      disconnectCalls.push(swarmPublicKeyHex)
-    },
-    sendRedeemInviteOverInternet: async (deviceId, redeem) => {
-      redeemCalls.push([deviceId, redeem])
-    },
+    discovery: mock.discovery,
     inviteApi: /** @type {InviteApi} */ (/** @type {unknown} */ (inviteApi)),
+    getDeviceInfo: () => ({ name: 'invitee', deviceType: 'mobile' }),
   })
 
-  /** @type {import('../src/invite/invite-link-joiner.js').JoinRequestUpdate[]} */
+  /** @type {JoinRequestUpdate[]} */
   const updates = []
   joiner.on('join-request-update', (update) => updates.push(update))
 
-  const onConnecting = pEvent(joiner, 'join-request-update', {
-    timeout: 1000,
-    filter: ({ status }) => status === 'connecting',
-  })
-  const onConnected = pEvent(joiner, 'join-request-update', {
-    timeout: 1000,
-    filter: ({ status }) => status === 'connected',
-  })
-  const onAccepted = pEvent(joiner, 'join-request-update', {
-    timeout: 1000,
-    filter: ({ status }) => status === 'accepted',
-  })
-  const onCompleted = pEvent(joiner, 'join-request-update', {
-    timeout: 1000,
-    filter: ({ status }) => status === 'completed',
-  })
+  const onConnected = onStatus(joiner, 'connected')
+  const onRequested = onStatus(joiner, 'requested')
+  const onAccepted = onStatus(joiner, 'accepted')
+  const onCompleted = onStatus(joiner, 'completed')
 
   const joinRequest = joiner.createJoinRequest(url)
-
   assert.equal(joinRequest.status, 'connecting')
   assert.equal(joinRequest.inviteId, inviteId.toString('hex'))
 
-  // Wait for 'connecting' update if we dont have it yet
-  await onConnecting
-  assert.equal(updates.length, 2)
-  assert.equal(updates[0].status, 'connecting')
-
-  // Verify connectPeer was called
-  assert.deepEqual(connectCalls, [swarmPublicKey.toString('hex')])
-
-  // Status should now be 'connected'
   await onConnected
-  assert.equal(updates[1].status, 'connected')
+  assert.deepEqual(mock.connectCalls, [swarmPublicKey.toString('hex')])
 
-  // Verify redeem was sent with correct identity key
-  assert.equal(redeemCalls.length, 1)
-  assert.equal(
-    redeemCalls[0][0],
-    authenticatedPublicKey.toString('hex'),
-    'redeem sent to identity key, not swarm key'
-  )
-  assert.ok(
-    redeemCalls[0][1].inviteId.equals(inviteId),
-    'redeem sent with correct inviteId'
-  )
+  // Redeem was sent with our device info, but not acked yet
+  assert.equal(mock.redeemCalls.length, 1)
+  assert.ok(mock.redeemCalls[0].inviteId.equals(inviteId))
+  assert.equal(mock.redeemCalls[0].deviceName, 'invitee')
+  assert.equal(mock.redeemCalls[0].deviceType, 'mobile')
+  assert.equal(joinRequest.status, 'connected')
 
-  // Simulate the inviter sending back the invite
+  // Invitor acks: we are now waiting on a human
+  mock.ackRedeem()
+  await onRequested
+
+  // Invitor admits
+  mock.admit()
+  await onAccepted
+
+  // Invitor sends the invite over RPC
   inviteApi.emit('invite-received', {
-    invitorDeviceId: authenticatedPublicKey.toString('hex'),
+    invitorDeviceId: invitorIdentity.toString('hex'),
     inviteId: inviteId.toString('hex'),
   })
 
-  // Wait for 'accepted' update
-  await onAccepted
-  assert.equal(updates[2].status, 'accepted')
+  const completed = await onCompleted
+  assert.equal(completed.projectId, projectId)
 
-  // Wait for 'completed' update
-  await onCompleted
-  assert.equal(updates[3].status, 'completed')
-  assert.equal(updates[3].projectId, projectId)
+  assert.deepEqual(
+    updates.map((u) => u.status),
+    ['connecting', 'connected', 'requested', 'accepted', 'completed']
+  )
 
-  // Verify join request is removed from pending
+  // Join request is removed and we stop redialling the invitor
   assert.throws(() => joiner.getJoinRequestById(inviteId.toString('hex')), {
     code: 'JOIN_REQUEST_NOT_FOUND_ERROR',
   })
+  assert.deepEqual(mock.leaveCalls, [swarmPublicKey.toString('hex')])
+  assert.deepEqual(mock.disconnectCalls, [])
+})
 
-  // Close the connection
-  connection.end()
+test('invite received before admission resolves is not missed', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const invitorIdentity = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const url = testUrl(inviteId, swarmPublicKey)
+
+  const connection = mockConnection(invitorIdentity)
+  const inviteApi = new MockInviteApi()
+  const mock = mockDiscovery(connection)
+
+  const joiner = new InviteLinkJoiner({
+    discovery: mock.discovery,
+    inviteApi: /** @type {InviteApi} */ (/** @type {unknown} */ (inviteApi)),
+    getDeviceInfo: () => ({}),
+  })
+
+  const onRequested = onStatus(joiner, 'requested')
+  const onCompleted = onStatus(joiner, 'completed')
+  joiner.createJoinRequest(url)
+  mock.ackRedeem()
+  await onRequested
+
+  // Invite arrives on the same tick as the admit
+  inviteApi.emit('invite-received', {
+    invitorDeviceId: invitorIdentity.toString('hex'),
+    inviteId: inviteId.toString('hex'),
+  })
+  mock.admit()
+
+  await onCompleted
+})
+
+test('denied by invitor fails with the deny reason', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const url = testUrl(inviteId, swarmPublicKey)
+  const connection = mockConnection(randomBytes(32))
+  const mock = mockDiscovery(connection)
+
+  const joiner = new InviteLinkJoiner({
+    discovery: mock.discovery,
+    inviteApi: /** @type {InviteApi} */ (
+      /** @type {unknown} */ (new MockInviteApi())
+    ),
+    getDeviceInfo: () => ({}),
+  })
+
+  const onFailed = onStatus(joiner, 'failed')
+  joiner.createJoinRequest(url)
+  mock.ackRedeem()
+  mock.deny(new InviteDeniedByInviterError({ reason: 'invitor_denied' }))
+
+  const failed = await onFailed
+  assert.equal(failed.error?.name, InviteDeniedByInviterError.name)
+  assert.deepEqual(mock.disconnectCalls, [swarmPublicKey.toString('hex')])
+  assert.deepEqual(mock.leaveCalls, [swarmPublicKey.toString('hex')])
+})
+
+test('connection closed before decision fails with a connection error', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const url = testUrl(inviteId, swarmPublicKey)
+  const connection = mockConnection(randomBytes(32))
+  const mock = mockDiscovery(connection)
+
+  const joiner = new InviteLinkJoiner({
+    discovery: mock.discovery,
+    inviteApi: /** @type {InviteApi} */ (
+      /** @type {unknown} */ (new MockInviteApi())
+    ),
+    getDeviceInfo: () => ({}),
+  })
+
+  const onFailed = onStatus(joiner, 'failed')
+  joiner.createJoinRequest(url)
+  mock.ackRedeem()
+  mock.deny(new InviteRedeemConnectionClosedError())
+
+  const failed = await onFailed
+  assert.equal(failed.error?.name, InviteConnectionError.name)
+  assert.equal(
+    /** @type {any} */ (failed.error).cause?.code,
+    InviteRedeemConnectionClosedError.code
+  )
+})
+
+test('cancelling while waiting for the invitor to decide', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const url = testUrl(inviteId, swarmPublicKey)
+  const connection = mockConnection(randomBytes(32))
+  const mock = mockDiscovery(connection)
+
+  const joiner = new InviteLinkJoiner({
+    discovery: mock.discovery,
+    inviteApi: /** @type {InviteApi} */ (
+      /** @type {unknown} */ (new MockInviteApi())
+    ),
+    getDeviceInfo: () => ({}),
+  })
+
+  const onRequested = onStatus(joiner, 'requested')
+  const onFailed = onStatus(joiner, 'failed')
+  joiner.createJoinRequest(url)
+  mock.ackRedeem()
+  await onRequested
+
+  joiner.cancelJoinRequest(inviteId.toString('hex'))
+
+  const failed = await onFailed
+  assert.equal(failed.error?.name, JoinProjectCancelledError.name)
+  assert.deepEqual(mock.disconnectCalls, [swarmPublicKey.toString('hex')])
 })

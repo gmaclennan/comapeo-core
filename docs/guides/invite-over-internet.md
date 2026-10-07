@@ -2,6 +2,25 @@
 
 ## Concepts
 
+A remote connection goes through three stages before the invitee is a member:
+
+1. **Connect**: the invitee connects to the invitor's swarm key from the URL,
+   and both sides prove their stable identity key.
+2. **Admission**: the invitee redeems the invite ID on the `comapeo/invite-link`
+   channel. This is the only thing an un-admitted remote peer can do: the RPC
+   channel used for invites, device info and map sharing is not opened until
+   the invitor admits the peer. The invitor acknowledges the request straight
+   away (so the invitee knows it arrived), and admits or denies it once the
+   user decides. Denies are acknowledged too, so the invitee gets the reason
+   before the connection closes. A remote peer that neither redeems nor is
+   admitted within `admissionTimeout` is disconnected.
+3. **Invite**: once admitted the usual invite flow runs over RPC: invite,
+   response, project join details, initial sync.
+
+Other open projects on either device will sync with the peer once it is
+admitted and the usual role checks pass, exactly as for a peer on the local
+network.
+
 ## Steps
 
 - Invitor: Set up project
@@ -71,7 +90,7 @@ const {
 } = parseInviteURL(url)
 
 // Listen for join progress updates
-// update.status: 'connecting' | 'connected' | 'accepted' | 'completed' | 'failed'
+// update.status: 'connecting' | 'connected' | 'requested' | 'accepted' | 'completed' | 'failed'
 // update.projectId is set on 'completed'
 // update.inviteId can be used to differantiat between concurrent invites
 // update.url is te original URL
@@ -82,11 +101,15 @@ manager.inviteLinks.on('join-request-update', (update) => {
       // Showing "waiting to connect" screen
       break
     case 'connected':
-      // Connected to the invitor and waiting for accept/deny
-      // Show "waiting for accept" screen
+      // Connected to the invitor and verified its identity, sending request
+      break
+    case 'requested':
+      // The invitor has received the request and its user is deciding
+      // Show "waiting for accept" screen. This can take as long as the
+      // invitor's user takes; a failure here is a deny, cancel or disconnect
       break
     case 'accepted':
-      // Invitor has accepted, initial sync in progress
+      // Invitor has admitted us, invite and initial sync in progress
       // Show "joining project" screen
       break
     case 'completed':
@@ -112,7 +135,7 @@ const {
   inviteId,
   swarmPublicKey,
   url: originalUrl,
-  status,     // 'connecting' | 'connected' | 'accepted' | 'completed' | 'failed'
+  status,     // 'connecting' | 'connected' | 'requested' | 'accepted' | 'completed' | 'failed'
   error,      // Error | null — set on 'failed'
   projectId,  // string | undefined — set on 'completed'
 } = manager.inviteLinks.createJoinRequest(url)

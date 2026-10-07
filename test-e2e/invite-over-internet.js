@@ -15,8 +15,8 @@ import {
   InviteRedeemConnectionClosedError,
   ensureKnownError,
   InviteNotYetRedeemedError,
+  PeerDisconnectedSinceRedeemingInviteError,
   InviteDeniedByInviterError,
-  InviteAbortedError,
   JoinProjectCancelledError,
   UnknownInviteIDError,
   InviteConnectionError,
@@ -24,7 +24,6 @@ import {
 import { makeInviteURL, parseInviteURL } from '../src/invite/invite-urls.js'
 import { temporaryDirectory } from 'tempy'
 import { kForceAddProjectFail } from '../src/mapeo-manager.js'
-import { LocalPeers } from '../src/local-peers.js'
 
 /**
  * Await a join request update for a given inviteId until it reaches a terminal
@@ -401,13 +400,19 @@ test('invite over internet errors if inviter closes before accepting', async (t)
     invitor.close(),
   ])
 
+  // Depending on whether the disconnect has been processed yet, the pending
+  // request is either already gone or the peer is found to be gone on accept
   await assert.rejects(
     () =>
       project.$member.acceptInviteLinkRequest(
         attemptedRedeemId,
         invitee.deviceId
       ),
-    (err) => ensureKnownError(err).code === InviteNotYetRedeemedError.code,
+    (err) =>
+      /** @type {string[]} */ ([
+        InviteNotYetRedeemedError.code,
+        PeerDisconnectedSinceRedeemingInviteError.code,
+      ]).includes(ensureKnownError(err).code),
     'Accepting after a disconnect causes an error'
   )
 })
@@ -512,10 +517,16 @@ test('invite over internet can be cancelled by invitee', async (t) => {
     invitee.inviteLinks.cancelJoinRequest(inviteId),
   ])
 
-  // Accepting after the invitee disconnected should also fail
+  // Accepting after the invitee disconnected should also fail: the pending
+  // request is cleared when its connection closes, or the peer is found to be
+  // gone on accept, depending on timing
   await assert.rejects(
     () => project.$member.acceptInviteLinkRequest(inviteId, deviceId),
-    (err) => ensureKnownError(err).code === InviteAbortedError.code,
+    (err) =>
+      /** @type {string[]} */ ([
+        InviteNotYetRedeemedError.code,
+        PeerDisconnectedSinceRedeemingInviteError.code,
+      ]).includes(ensureKnownError(err).code),
     'Accepting after cancel causes an error'
   )
 })
@@ -703,18 +714,15 @@ test('invite over the internet removes project and removes member when failing t
   assert.equal(gotProjectId, projectId, 'Invited to project')
 })
 
-test('untrusted peer is disconnected after untrustedTimeout', async (t) => {
-  process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled rejection:', reason)
-  })
+test('remote peer that never redeems is disconnected after admissionTimeout', async (t) => {
   const testnet = await createTestnet(2)
   t.after(() => testnet.destroy())
 
-  const UNTRUSTED_TIMEOUT = 1000
+  const ADMISSION_TIMEOUT = 1000
 
   const manager = createManager('invitor', t, {
     swarm: { dht: testnet.nodes[0] },
-    untrustedTimeout: UNTRUSTED_TIMEOUT,
+    admissionTimeout: ADMISSION_TIMEOUT,
   })
 
   await manager.setDeviceInfo({ name: 'invitor', deviceType: 'desktop' })
@@ -730,7 +738,7 @@ test('untrusted peer is disconnected after untrustedTimeout', async (t) => {
 
   const { swarmPublicKey } = parseInviteURL(url)
 
-  // Create a separate RemoteDiscovery to connect as an untrusted peer
+  // A bare RemoteDiscovery that authenticates but never redeems an invite
   const identityKeypair = new KeyManager(
     Buffer.alloc(16, 99)
   ).getIdentityKeypair()
@@ -745,18 +753,13 @@ test('untrusted peer is disconnected after untrustedTimeout', async (t) => {
   })
   t.after(() => remoteDiscovery.close())
 
-  const localPeers = new LocalPeers()
-
   await remoteDiscovery.start()
 
-  // Connect to the manager's swarm key (inbound on manager side → isTrusted = false)
   const connection = await remoteDiscovery.connectPeer(swarmPublicKey, {
     timeout: 10000,
   })
 
-  // Set up protomux connection
-  localPeers.connect(connection, true)
-
-  // Connection should close within untrustedTimeout + small buffer
-  await pEvent(connection, 'close', { timeout: UNTRUSTED_TIMEOUT + 2000 })
+  // The manager never emits the connection, so nothing replicates with it
+  // and it is closed once the admission timeout passes
+  await pEvent(connection, 'close', { timeout: ADMISSION_TIMEOUT + 2000 })
 })

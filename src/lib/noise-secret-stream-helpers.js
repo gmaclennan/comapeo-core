@@ -7,11 +7,12 @@
  */
 
 /**
- * A noise stream that has been authenticated with a stable public key and
- * has an explicit trust flag. Both LocalDiscovery and RemoteDiscovery emit
- * streams of this shape, so downstream code does not need runtime type checks.
+ * A noise stream that has been authenticated with a stable identity public
+ * key. Both LocalDiscovery and RemoteDiscovery emit streams of this shape, and
+ * only emit them once the peer may be talked to over RPC, so downstream code
+ * does not need runtime type checks or trust checks.
  *
- * @typedef {OpenedNoiseStream & { authenticatedPublicKey: Buffer, isTrusted: boolean }} AuthedNoiseStream
+ * @typedef {OpenedNoiseStream & { authenticatedPublicKey: Buffer }} AuthedNoiseStream
  */
 
 /**

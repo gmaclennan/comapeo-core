@@ -60,7 +60,7 @@ test('RemoteDiscovery - connect two instances and verify keypair', async (t) => 
   const swarmPublicKey1Hex = swarmKeypair1.publicKey.toString('hex')
 
   // Listen for connection on instance 1
-  const onConnection = pEvent(remoteDiscovery1, 'connection')
+  const onConnection = pEvent(remoteDiscovery1, 'authenticated')
 
   // Connect from instance 2 to instance 1
   const connectionPromise = remoteDiscovery2.connectPeer(swarmPublicKey1Hex)
@@ -188,7 +188,7 @@ test('RemoteDiscovery - Able to reconnect after disconnecting', async (t) => {
   const swarmPublicKey2Hex = swarmKeypair2.publicKey.toString('hex')
 
   // Listen for connection on instance 1
-  const onConnection = pEvent(remoteDiscovery1, 'connection')
+  const onConnection = pEvent(remoteDiscovery1, 'authenticated')
 
   // Connect from instance 2 to instance 1
   const connectionPromise = remoteDiscovery2.connectPeer(swarmPublicKey1Hex)
@@ -225,7 +225,7 @@ test('RemoteDiscovery - Able to reconnect after disconnecting', async (t) => {
   ])
 
   // Listen for connection on instance 1
-  const onConnection2 = pEvent(remoteDiscovery1, 'connection')
+  const onConnection2 = pEvent(remoteDiscovery1, 'authenticated')
 
   // Connect from instance 2 to instance 1
   const connectionPromise2 = remoteDiscovery2.connectPeer(swarmPublicKey1Hex)
@@ -297,7 +297,7 @@ test('RemoteDiscovery - connect two peers to a third peer', async (t) => {
   const swarmPublicKey1Hex = swarmKeypair1.publicKey.toString('hex')
 
   // Listen for two inbound connections on peer 1
-  const onConnectionFromPeer2 = pEvent(remoteDiscovery1, 'connection')
+  const onConnectionFromPeer2 = pEvent(remoteDiscovery1, 'authenticated')
 
   // Peer 2 connects to peer 1
   const connectionPromise2 = remoteDiscovery2.connectPeer(swarmPublicKey1Hex)
@@ -314,7 +314,7 @@ test('RemoteDiscovery - connect two peers to a third peer', async (t) => {
   )
 
   // Now peer 3 also connects to peer 1
-  const onConnectionFromPeer3 = pEvent(remoteDiscovery1, 'connection', {
+  const onConnectionFromPeer3 = pEvent(remoteDiscovery1, 'authenticated', {
     timeout: 5000,
   })
   const connectionPromise3 = remoteDiscovery3.connectPeer(swarmPublicKey1Hex)
@@ -503,7 +503,7 @@ test('RemoteDiscovery - emits InvalidIdentityProofError on invalid signature', a
   await serverPromise
 })
 
-test('RemoteDiscovery - valid auth handshake completes and emits connection', async (t) => {
+test('RemoteDiscovery - valid auth handshake completes and emits authenticated', async (t) => {
   const identityKeypair = new KeyManager(
     Buffer.alloc(16, 1)
   ).getIdentityKeypair()
@@ -526,7 +526,7 @@ test('RemoteDiscovery - valid auth handshake completes and emits connection', as
     handshakeHash
   )
 
-  const onConnection = pEvent(discovery, 'connection', { timeout: 5000 })
+  const onConnection = pEvent(discovery, 'authenticated', { timeout: 5000 })
   const serverPromise =
     discovery[kTestOnlyHandleHyperswarmConnection](serverSocket)
 

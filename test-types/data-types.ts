@@ -20,6 +20,7 @@ import { projectSettingsTable } from '../dist/schema/client.js'
 import { LocalPeers } from '../dist/local-peers.js'
 import { Expect, type Equal } from './utils.js'
 import { InviteLinksApi } from '../dist/invite/invite-links-api.js'
+import { RemoteDiscovery } from '../dist/discovery/remote-discovery.js'
 
 type ObservationWithDerivedDocFields = Observation & DerivedDocFields
 type PresetWithDerivedDocFields = Preset & DerivedDocFields
@@ -48,8 +49,11 @@ const mapeoProject = new MapeoProject({
   localPeers: new LocalPeers(),
   inviteLinks: new InviteLinksApi(drizzle(sqlite), () => Promise.resolve()),
   getFallbackProjectInfo: () => ({ sendStats: false }),
-  markInternetPeerAsTrusted: async (_deviceId) => Promise.resolve(true),
-  disconnectFromPeer: async (_deviceId) => Promise.resolve(),
+  remoteDiscovery: new RemoteDiscovery({
+    identityKeypair: new KeyManager(randomBytes(32)).getIdentityKeypair(),
+    deriveSwarmIdentityKeypair: () =>
+      new KeyManager(randomBytes(32)).getIdentityKeypair(),
+  }),
 })
 
 ///// Observations

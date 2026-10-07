@@ -1,6 +1,9 @@
 import { TypedEmitter } from 'tiny-typed-emitter'
 import { pEvent } from 'p-event'
 import { parseInviteURL } from './invite-urls.js'
+import { DeviceInfo_DeviceType } from '../generated/rpc.js'
+import { Logger } from '../logger.js'
+import { noop } from '../utils.js'
 import {
   ExistingJoinRequestError,
   InviteRedeemConnectionClosedError,
@@ -13,7 +16,6 @@ import {
   RPCDisconnectBeforeAckError,
   UnknownPeerError,
   InitialSyncFailedError,
-  UntrustedRPCMethodError,
   ensureKnownError,
 } from '../errors.js'
 
@@ -29,15 +31,20 @@ const NETWORK_ERROR_CODES = new Set([
   RPCDisconnectBeforeAckError.code,
   UnknownPeerError.code,
   InitialSyncFailedError.code,
-  UntrustedRPCMethodError.code,
 ])
 
 /** @import { RemoteDiscovery } from '../discovery/remote-discovery.js' */
-/** @import { LocalPeers } from '../local-peers.js' */
 /** @import { InviteApi } from '../invite/invite-api.js' */
 
 /**
- * @typedef {'connecting' | 'connected' | 'accepted' | 'completed' | 'failed'} JoinRequestStatus
+ * - `connecting`: finding and connecting to the invitor, verifying its identity
+ * - `connected`: identity verified, sending the redeem request
+ * - `requested`: the invitor has acknowledged the request and its user is deciding
+ * - `accepted`: the invitor accepted; receiving the invite and joining
+ * - `completed`: joined, `projectId` is set
+ * - `failed`: `error` is set
+ *
+ * @typedef {'connecting' | 'connected' | 'requested' | 'accepted' | 'completed' | 'failed'} JoinRequestStatus
  */
 
 /**
@@ -62,23 +69,16 @@ const NETWORK_ERROR_CODES = new Set([
  */
 
 /**
- * @typedef {object} ConnectPeerOptions
- * @property {number} [timeout]
- * @property {AbortSignal} [signal]
- */
-
-/**
- * @typedef {object} RedeemInvite
- * @property {Buffer} inviteId
+ * @typedef {Pick<RemoteDiscovery, 'connectPeer' | 'redeem' | 'waitForAdmission' | 'disconnectPeer' | 'leavePeer'>} JoinerDiscovery
  */
 
 /**
  * @typedef {object} InviteLinkJoinerOptions
- * @property {(swarmPublicKey: string, opts?: ConnectPeerOptions) => Promise<import('../lib/noise-secret-stream-helpers.js').AuthedNoiseStream>} options.connectPeer Connect to a remote peer
- * @property {(swarmPublicKey: string) => Promise<void>} options.disconnectPeer Disconnect from a remote peer
- * @property {(deviceId: string, redeem: RedeemInvite) => Promise<void>} options.sendRedeemInviteOverInternet Send redeem request to a peer
- * @property {Pick<InviteApi, 'on' | 'accept'>} options.inviteApi Invite API (on + accept only)
- * @property {number} [options.defaultTimeout] Default timeout in ms for peer connection (default: 60_000)
+ * @property {JoinerDiscovery} discovery Remote discovery used to connect to and get admitted by the invitor
+ * @property {Pick<InviteApi, 'on' | 'accept'>} inviteApi Invite API (on + accept only)
+ * @property {() => { name?: string, deviceType?: string }} getDeviceInfo Our device info, shown to the invitor when they decide
+ * @property {number} [defaultTimeout] Default timeout in ms for peer connection (default: 60_000)
+ * @property {Logger} [logger]
  */
 
 /**
@@ -93,19 +93,19 @@ const NETWORK_ERROR_CODES = new Set([
  */
 
 /**
+ * Invitee side of invites over the internet: turns an invite URL into a
+ * project membership by connecting to the invitor, redeeming the invite link
+ * on the invite-link channel, and then accepting the regular invite that the
+ * invitor sends over RPC once it has admitted us.
+ *
  * @extends {TypedEmitter<InviteLinkJoinerEvents>}
  */
 export class InviteLinkJoiner extends TypedEmitter {
-  /** @type {InviteLinkJoinerOptions['connectPeer']} */
-  #connectPeer
-  /** @type {InviteLinkJoinerOptions['disconnectPeer']} */
-  #disconnectPeer
-  /** @type {InviteLinkJoinerOptions['sendRedeemInviteOverInternet']} */
-  #sendRedeemInviteOverInternet
-  /** @type {InviteLinkJoinerOptions['inviteApi']} */
+  #discovery
   #inviteApi
-  /** @type {number} */
+  #getDeviceInfo
   #defaultTimeout
+  #l
   /** @type {Map<string, PendingJoinRequest>} */
   #pending = new Map()
 
@@ -113,17 +113,17 @@ export class InviteLinkJoiner extends TypedEmitter {
    * @param {InviteLinkJoinerOptions} options
    */
   constructor({
-    connectPeer,
-    disconnectPeer,
-    sendRedeemInviteOverInternet,
+    discovery,
     inviteApi,
+    getDeviceInfo,
     defaultTimeout = 60_000,
+    logger,
   }) {
     super()
-    this.#connectPeer = connectPeer
-    this.#disconnectPeer = disconnectPeer
-    this.#sendRedeemInviteOverInternet = sendRedeemInviteOverInternet
+    this.#l = Logger.create('inviteLinkJoiner', logger)
+    this.#discovery = discovery
     this.#inviteApi = inviteApi
+    this.#getDeviceInfo = getDeviceInfo
     this.#defaultTimeout = defaultTimeout
   }
 
@@ -143,7 +143,7 @@ export class InviteLinkJoiner extends TypedEmitter {
       throw new ExistingJoinRequestError({ inviteId })
     }
 
-    const redeemAbortController = new AbortController()
+    const abortController = new AbortController()
     /** @type {JoinRequest} */
     const joinRequest = {
       inviteId,
@@ -153,41 +153,60 @@ export class InviteLinkJoiner extends TypedEmitter {
       error: null,
       projectId: undefined,
     }
-    this.#pending.set(inviteId, {
-      abortController: redeemAbortController,
-      joinRequest,
-    })
+    this.#pending.set(inviteId, { abortController, joinRequest })
 
     this.#emitUpdate(joinRequest)
 
     // Start the async flow (fire-and-forget)
-    this.#runJoinFlow(joinRequest, parsed, timeout, redeemAbortController)
+    this.#runJoinFlow(joinRequest, timeout, abortController.signal)
 
     return joinRequest
   }
 
   /**
    * @param {JoinRequest} joinRequest
-   * @param {ReturnType<typeof parseInviteURL>} parsed
    * @param {number} timeout
-   * @param {AbortController} redeemAbortController
+   * @param {AbortSignal} signal
    */
-  async #runJoinFlow(joinRequest, parsed, timeout, redeemAbortController) {
-    const { inviteIdString, swarmPublicKey } = parsed
-    const inviteIdBuffer = Buffer.from(inviteIdString, 'hex')
-    const signal = redeemAbortController.signal
+  async #runJoinFlow(joinRequest, timeout, signal) {
+    const { inviteId: inviteIdString, swarmPublicKey } = joinRequest
+    const inviteId = Buffer.from(inviteIdString, 'hex')
 
     try {
-      const connection = await this.#connectPeer(swarmPublicKey, {
+      const connection = await this.#discovery.connectPeer(swarmPublicKey, {
         timeout,
         signal,
       })
 
-      signal.addEventListener(
-        'abort',
-        () => this.#disconnectPeer(swarmPublicKey),
-        { once: true }
-      )
+      // Connected: the invitor has proven its identity
+      this.#setStatus(joinRequest, 'connected')
+
+      // Use the identity key from the handshake, not the swarm key from the URL
+      const invitorDeviceId = connection.authenticatedPublicKey.toString('hex')
+
+      // Start listening for the invite before we can be admitted, so a fast
+      // invitor cannot send it before we are listening
+      const onInvited = pEvent(this.#inviteApi, 'invite-received', {
+        filter: (invite) => invite.invitorDeviceId === invitorDeviceId,
+        signal,
+      })
+      onInvited.catch(noop)
+
+      const { name = '', deviceType } = this.#getDeviceInfo()
+      await this.#discovery.redeem(connection, {
+        inviteId,
+        deviceName: name,
+        deviceType: toRpcDeviceType(deviceType),
+      })
+
+      // Requested: the invitor has our request and its user is deciding
+      this.#setStatus(joinRequest, 'requested')
+
+      // Resolves when admitted, rejects on deny, disconnect or cancel
+      await this.#discovery.waitForAdmission(connection, { signal })
+
+      // Accepted: we are admitted, the regular invite follows over RPC
+      this.#setStatus(joinRequest, 'accepted')
 
       const onClose = pEvent(connection, 'close').then(
         () => {
@@ -198,61 +217,42 @@ export class InviteLinkJoiner extends TypedEmitter {
           throw new InviteRedeemConnectionClosedError({ cause: e })
         }
       )
-      // It's okay if this rejection never gets handled
       onClose.catch(noop)
 
-      // Connected
-      joinRequest.status = 'connected'
-      this.#emitUpdate(joinRequest)
+      const invite = await Promise.race([onInvited, onClose])
 
-      // Use the identity key from the handshake, not the swarm key from the URL
-      const identityPublicKeyHex =
-        connection.authenticatedPublicKey.toString('hex')
-
-      const onInvited = pEvent(this.#inviteApi, 'invite-received', {
-        filter: (invite) => invite.invitorDeviceId === identityPublicKeyHex,
-        signal,
-      })
-
-      // Race: wait for invite vs connection close
-      const [invite] = await Promise.race([
-        Promise.all([
-          onInvited,
-          this.#sendRedeemInviteOverInternet(identityPublicKeyHex, {
-            inviteId: inviteIdBuffer,
-          }),
-        ]),
-        onClose,
-      ])
-
-      // Accepted
-      joinRequest.status = 'accepted'
-      this.#emitUpdate(joinRequest)
-
-      const projectId = await this.#inviteApi.accept(
-        /** @type {{ inviteId: string }} */ (invite)
-      )
+      const projectId = await this.#inviteApi.accept(invite)
 
       // Completed
-      joinRequest.status = 'completed'
       joinRequest.projectId = projectId
-      this.#emitUpdate(joinRequest)
+      this.#setStatus(joinRequest, 'completed')
 
       connection.end()
     } catch (e) {
-      // Failed
-      joinRequest.status = 'failed'
       joinRequest.error = wrapNetworkError(e)
-      this.#emitUpdate(joinRequest)
+      this.#setStatus(joinRequest, 'failed')
+      this.#l.log('join request %S failed: %s', inviteIdString, e)
 
       try {
-        await this.#disconnectPeer(swarmPublicKey)
+        await this.#discovery.disconnectPeer(swarmPublicKey)
       } catch {
         // ignore disconnect errors
       }
     } finally {
+      // Hyperswarm keeps redialling a joined peer until we leave it. The
+      // connection was only needed for the invite, so stop here.
+      this.#discovery.leavePeer(swarmPublicKey)
       this.#pending.delete(inviteIdString)
     }
+  }
+
+  /**
+   * @param {JoinRequest} joinRequest
+   * @param {JoinRequestStatus} status
+   */
+  #setStatus(joinRequest, status) {
+    joinRequest.status = status
+    this.#emitUpdate(joinRequest)
   }
 
   /**
@@ -310,8 +310,27 @@ export class InviteLinkJoiner extends TypedEmitter {
   }
 }
 
-/** @param {unknown} _x */
-function noop(_x) {}
+/** @type {Set<string>} */
+const RPC_DEVICE_TYPES = new Set(Object.values(DeviceInfo_DeviceType))
+
+/**
+ * The device type in our saved device info is the @comapeo/schema type, which
+ * is a superset of the RPC enum; anything the RPC cannot express is sent as
+ * unspecified.
+ *
+ * @param {string | undefined} deviceType
+ * @returns {DeviceInfo_DeviceType}
+ */
+function toRpcDeviceType(deviceType) {
+  if (
+    deviceType &&
+    deviceType !== DeviceInfo_DeviceType.UNRECOGNIZED &&
+    RPC_DEVICE_TYPES.has(deviceType)
+  ) {
+    return /** @type {DeviceInfo_DeviceType} */ (deviceType)
+  }
+  return DeviceInfo_DeviceType.device_type_unspecified
+}
 
 /**
  * Wrap network/transport errors in an InviteConnectionError, pass others through.
