@@ -10,7 +10,6 @@ import pDefer from 'p-defer'
 import { noop, timeoutPromise } from '../utils.js'
 import { Hello, IdentityProof } from '../generated/auth.js'
 import { InviteLinkChannel } from '../invite/invite-link-channel.js'
-import { PROTOCOL_NAME as RPC_PROTOCOL_NAME } from '../local-peers.js'
 import {
   AuthProtocolVersionMismatchError,
   ensureKnownError,
@@ -35,7 +34,7 @@ import {
  * @typedef {Object} DiscoveryEvents
  * @property {(connection: RemoteAuthedNoiseStream) => void} connection Emitted once a peer is admitted: it may now open the RPC channel and replicate
  * @property {(connection: RemoteAuthedNoiseStream) => void} authenticated Emitted once a peer has proven its identity, before it is admitted. Only the invite-link protocol is available on the connection at this point.
- * @property {(deviceId: string, redeem: Redeem) => void} redeem Emitted when an authenticated peer asks to redeem an invite link. The request has already been acknowledged; call `admit()` or `deny()` to decide.
+ * @property {(deviceId: string, redeem: Redeem) => void} redeem Emitted when an authenticated peer asks to redeem an invite link. The request has already been acknowledged; call `admit()` or `deny()` to decide. A peer may repeat a redeem (e.g. after a dropped connection), in which case this is emitted again for the same device and invite.
  * @property {(deviceId: string) => void} peer-closed Emitted when a connection to an authenticated peer closes, whether or not it was admitted
  * @property {(error: Error) => void} error
  */
@@ -60,7 +59,7 @@ export const DEFAULT_ADMISSION_TIMEOUT = 16_000
 /**
  * How long we remember that a device was admitted, so that a dropped and
  * redialled connection during an invite flow is re-admitted without a new
- * redeem.
+ * redeem, and replication can resume.
  */
 const ADMITTED_TTL = 5 * 60_000
 
@@ -86,19 +85,40 @@ class RemoteConnection {
   awaitingDecision = false
   /** @type {DeferredPromise<void>} resolves when authenticated, rejects on failure */
   authenticated = pDefer()
-  /** @type {DeferredPromise<void>} resolves when admitted, rejects on deny or close */
-  admitted = pDefer()
+  /**
+   * The invitor's decision on each invite link we have redeemed on this
+   * connection, keyed by invite ID hex. Resolves on Admit for that invite,
+   * rejects on Deny for that invite or when the connection closes. Kept per
+   * invite so that two links redeemed on one connection are decided
+   * independently.
+   * @type {Map<string, DeferredPromise<void>>}
+   */
+  decisions = new Map()
 
   /** @param {OpenedNoiseStream} socket */
   constructor(socket) {
     this.socket = socket
-    // These may legitimately never be awaited
+    // This may legitimately never be awaited
     this.authenticated.promise.catch(noop)
-    this.admitted.promise.catch(noop)
   }
 
   get identityHex() {
     return this.identityPublicKey?.toString('hex')
+  }
+
+  /**
+   * @param {Buffer} inviteId
+   * @returns {DeferredPromise<void>}
+   */
+  decision(inviteId) {
+    const key = inviteId.toString('hex')
+    let deferred = this.decisions.get(key)
+    if (!deferred) {
+      deferred = pDefer()
+      deferred.promise.catch(noop)
+      this.decisions.set(key, deferred)
+    }
+    return deferred
   }
 }
 
@@ -118,6 +138,17 @@ class RemoteConnection {
  * Only admitted connections are emitted as `connection`, so consumers (the
  * RPC layer and hypercore replication) never see a peer we have not decided
  * to talk to.
+ *
+ * A note on ordering: protomux processes every message in a received chunk
+ * synchronously, and rejects an open for a protocol that has neither a
+ * channel nor a pairing yet. So (a) every channel the peer may open before
+ * admission is created up front, and (b) every state change that the peer's
+ * *next* message may depend on happens synchronously inside the message
+ * handler that triggers it, never in an `await` continuation. In particular
+ * the transition to authenticated, and any admission that follows from it,
+ * runs inside the identity-proof handler, so that the `mapeo/rpc` pairing that
+ * LocalPeers registers on `connection` exists before the peer's RPC open can
+ * be processed.
  *
  * @extends {TypedEmitter<DiscoveryEvents>}
  */
@@ -325,7 +356,8 @@ export class RemoteDiscovery extends TypedEmitter {
    * Ask the peer on this connection to redeem an invite link. Resolves once the
    * peer has acknowledged the request (it is now waiting for its user to
    * decide). Rejects if the request is not acknowledged in time or the
-   * connection closes.
+   * connection closes. Repeating a redeem for the same invite is allowed and
+   * is treated by the peer as the same request.
    *
    * @param {RemoteAuthedNoiseStream} socket connection returned by `connectPeer`
    * @param {Redeem} redeem
@@ -333,6 +365,8 @@ export class RemoteDiscovery extends TypedEmitter {
    */
   async redeem(socket, redeem) {
     const conn = this.#getAuthenticatedConnection(socket)
+    // Register interest in the decision before the peer can possibly answer
+    conn.decision(redeem.inviteId)
     await conn.inviteLink.sendRedeem(redeem)
     // The invitor has the request; from here on we wait on a human, not a timer
     conn.awaitingDecision = true
@@ -340,20 +374,23 @@ export class RemoteDiscovery extends TypedEmitter {
   }
 
   /**
-   * Wait for the peer on this connection to admit or deny us. Resolves once
-   * admitted (the `connection` event has fired by then). Rejects with
-   * UnknownInviteIDError or InviteDeniedByInviterError on a deny, with
-   * InviteRedeemConnectionClosedError if the connection closes first, or with
-   * the signal's reason if aborted.
+   * Wait for the peer on this connection to admit or deny the given invite.
+   * Resolves once admitted (the `connection` event has fired by then). Rejects
+   * with UnknownInviteIDError or InviteDeniedByInviterError on a deny of this
+   * invite, with InviteRedeemConnectionClosedError if the connection closes
+   * first, or with the signal's reason if aborted. A decision on a different
+   * invite redeemed on the same connection does not affect this wait.
    *
    * @param {RemoteAuthedNoiseStream} socket
+   * @param {Buffer} inviteId
    * @param {object} [opts]
    * @param {AbortSignal} [opts.signal]
    * @returns {Promise<void>}
    */
-  async waitForAdmission(socket, { signal } = {}) {
+  async waitForAdmission(socket, inviteId, { signal } = {}) {
     const conn = this.#getAuthenticatedConnection(socket)
-    if (!signal) return conn.admitted.promise
+    const decision = conn.decision(inviteId).promise
+    if (!signal) return decision
     signal.throwIfAborted()
     /** @type {() => void} */
     let onAbort = noop
@@ -362,7 +399,7 @@ export class RemoteDiscovery extends TypedEmitter {
       signal.addEventListener('abort', onAbort, { once: true })
     })
     try {
-      await Promise.race([conn.admitted.promise, abortPromise])
+      await Promise.race([decision, abortPromise])
     } finally {
       signal.removeEventListener('abort', onAbort)
     }
@@ -370,7 +407,8 @@ export class RemoteDiscovery extends TypedEmitter {
 
   /**
    * Admit a device that has redeemed an invite link. Sends `Admit` on every
-   * pending connection from that device and emits `connection` for each.
+   * connection from that device and emits `connection` for each that was not
+   * already admitted.
    *
    * @param {string} deviceId identity public key as hex
    * @param {Buffer} inviteId
@@ -381,8 +419,9 @@ export class RemoteDiscovery extends TypedEmitter {
     for (const conn of this.#findByIdentity(deviceId)) {
       found = true
       // Always tell the peer, even if we already admitted this connection on
-      // our side (a recently admitted device reconnecting): the peer may not
-      // have admitted us, and Admit is idempotent on the receiver
+      // our side (a recently admitted device reconnecting): the peer is
+      // waiting for the decision on this invite, and Admit is idempotent for
+      // connection-level admission on the receiver
       try {
         await conn.inviteLink?.sendAdmit({ inviteId })
       } catch (e) {
@@ -498,6 +537,38 @@ export class RemoteDiscovery extends TypedEmitter {
     return false
   }
 
+  /**
+   * Called synchronously from the identity-proof message handler once the
+   * peer's proof has been verified (see the class comment for why this must
+   * not run in an `await` continuation).
+   *
+   * @param {RemoteConnection} conn
+   * @param {Buffer} identityPublicKey
+   */
+  #onAuthenticated(conn, identityPublicKey) {
+    if (conn.state !== 'handshaking') return
+    const socket = conn.socket
+    // @ts-expect-error adding AuthedNoiseStream properties
+    socket.authenticatedPublicKey = identityPublicKey
+    conn.identityPublicKey = identityPublicKey
+    conn.state = 'authenticated'
+    const deviceId = identityPublicKey.toString('hex')
+
+    conn.authenticated.resolve()
+    this.emit('authenticated', /** @type {RemoteAuthedNoiseStream} */ (socket))
+
+    if (this.#isRecentlyAdmitted(deviceId)) {
+      // If only we remember the admission (the peer restarted mid-flow), our
+      // early RPC open is rejected by the peer and our RPC channel closes,
+      // which is harmless: the peer has nothing to resume, and its own
+      // admission timeout closes the connection shortly after.
+      this.#l.log('Re-admitting recently admitted peer %S', deviceId)
+      this.#admit(conn)
+      return
+    }
+    this.#startAdmissionTimer(conn)
+  }
+
   /** @param {RemoteConnection} conn */
   #admit(conn) {
     if (conn.state !== 'authenticated') return
@@ -506,14 +577,11 @@ export class RemoteDiscovery extends TypedEmitter {
     const deviceId = conn.identityHex
     if (deviceId) this.#admittedDevices.set(deviceId, Date.now() + ADMITTED_TTL)
     this.#l.log('Admitted peer %S', deviceId)
-    // Emit before resolving so that consumers set up their channels (LocalPeers
-    // pairs the RPC protocol synchronously) before anything awaiting admission
-    // continues
+    // Consumers set up their channels in this event, synchronously
     this.emit(
       'connection',
       /** @type {RemoteAuthedNoiseStream} */ (conn.socket)
     )
-    conn.admitted.resolve()
   }
 
   /**
@@ -524,11 +592,10 @@ export class RemoteDiscovery extends TypedEmitter {
     this.#connections.delete(conn.socket)
     this.#clearAdmissionTimer(conn)
     if (conn.state === 'closed') return
-    const wasAdmitted = conn.state === 'admitted'
     const deviceId = conn.identityHex
     conn.state = 'closed'
     conn.authenticated.reject(reason)
-    if (!wasAdmitted) conn.admitted.reject(reason)
+    for (const decision of conn.decisions.values()) decision.reject(reason)
     conn.inviteLink?.close()
     if (deviceId) this.emit('peer-closed', deviceId)
   }
@@ -552,15 +619,9 @@ export class RemoteDiscovery extends TypedEmitter {
       const protomux = Protomux.from(socket)
       socket.userData = protomux
 
-      // Protomux rejects an incoming channel open for a protocol that has
-      // neither a channel nor a pairing yet, so everything the peer may open
-      // must be ready (or paired) before the peer can send it:
-      //
-      // - The invite-link channel is created now, alongside the auth channel.
-      //   Its messages are ignored until the peer has proven its identity.
-      // - The RPC channel is only created by LocalPeers once admitted, so hold
-      //   any early open from the peer until then (the peer admits us first and
-      //   may open RPC before our own admission has been processed).
+      // The invite-link channel is created now, alongside the auth channel,
+      // because the peer may open it as soon as its own handshake completes.
+      // Its messages are ignored until the peer has proven its identity.
       const inviteLink = new InviteLinkChannel(protomux, { logger: this.#l })
       conn.inviteLink = inviteLink
       inviteLink.on('redeem', (redeem) => {
@@ -576,54 +637,30 @@ export class RemoteDiscovery extends TypedEmitter {
         this.#clearAdmissionTimer(conn)
         this.emit('redeem', /** @type {string} */ (conn.identityHex), redeem)
       })
-      inviteLink.on('admit', () => this.#admit(conn))
+      inviteLink.on('admit', ({ inviteId }) => {
+        // Connection-level admission on any Admit, decision per invite
+        this.#admit(conn)
+        conn.decision(inviteId).resolve()
+      })
       inviteLink.on('deny', (deny) => {
-        if (conn.state !== 'authenticated') return
         this.#l.log('Denied by %S: %s', conn.identityHex, deny.reason)
-        conn.admitted.reject(denyToError(deny))
+        conn.decision(deny.inviteId).reject(denyToError(deny))
       })
       inviteLink.on('close', () => {
-        if (conn.state !== 'authenticated') return
-        // Peer closed (or rejected) the invite-link channel without a decision
-        conn.admitted.reject(new InviteRedeemConnectionClosedError())
-      })
-      protomux.pair({ protocol: RPC_PROTOCOL_NAME }, async () => {
-        try {
-          await conn.admitted.promise
-        } catch {
-          return // not admitted: protomux rejects the peer's open
+        // Peer closed (or rejected) the invite-link channel: no decision on
+        // anything redeemed over it can arrive any more
+        for (const decision of conn.decisions.values()) {
+          decision.reject(new InviteRedeemConnectionClosedError())
         }
-        // Let the consumer of the `connection` event create its channel before
-        // protomux decides whether the held open was answered
-        await new Promise((resolve) => setImmediate(resolve))
       })
 
-      const identityPublicKey = await identityHandshake(
+      await identityHandshake(
         socket,
         protomux,
         this.#identityKeypair,
-        this.#l
+        this.#l,
+        (identityPublicKey) => this.#onAuthenticated(conn, identityPublicKey)
       )
-      if (conn.state === 'closed') return
-
-      // @ts-expect-error adding AuthedNoiseStream properties
-      socket.authenticatedPublicKey = identityPublicKey
-      conn.identityPublicKey = identityPublicKey
-      conn.state = 'authenticated'
-      const deviceId = identityPublicKey.toString('hex')
-
-      conn.authenticated.resolve()
-      this.emit(
-        'authenticated',
-        /** @type {RemoteAuthedNoiseStream} */ (socket)
-      )
-
-      if (this.#isRecentlyAdmitted(deviceId)) {
-        this.#l.log('Re-admitting recently admitted peer %S', deviceId)
-        this.#admit(conn)
-        return
-      }
-      this.#startAdmissionTimer(conn)
     } catch (err) {
       const error = ensureKnownError(err)
       this.#closeConnection(conn, error)
@@ -635,28 +672,39 @@ export class RemoteDiscovery extends TypedEmitter {
 
 /**
  * Run the `comapeo/auth` handshake on a freshly opened NOISE stream: exchange
- * Hello messages, then exchange identity proofs. Resolves with the peer's
- * verified identity public key.
+ * Hello messages, then exchange identity proofs.
+ *
+ * The handshake is driven by the message handlers rather than by sequential
+ * awaits: our proof is sent inside the Hello handler and `onAuthenticated` is
+ * called inside the proof handler, so that each step completes before protomux
+ * moves on to the peer's next message. The returned promise only reports the
+ * outcome (and enforces the timeout); it resolves after `onAuthenticated` has
+ * run.
  *
  * @param {OpenedNoiseStream} socket
  * @param {Protomux<any>} protomux
  * @param {Keypair} identityKeypair
  * @param {Logger} logger
- * @returns {Promise<Buffer>}
+ * @param {(identityPublicKey: Buffer) => void} onAuthenticated
+ * @returns {Promise<void>}
  */
-async function identityHandshake(socket, protomux, identityKeypair, logger) {
+function identityHandshake(
+  socket,
+  protomux,
+  identityKeypair,
+  logger,
+  onAuthenticated
+) {
   const remotePublicKeyString = socket.remotePublicKey.toString('hex')
-
-  const helloDefer = pDefer()
-  const identityDefer = pDefer()
-  const onAuthOpen = pDefer()
-  /** @type {ReturnType<typeof pDefer>} */
-  let drainDefer
+  /** @type {DeferredPromise<void>} */
+  const done = pDefer()
+  let gotHello = false
 
   const messages = [
     {
       encoding: cenc.raw,
       onmessage: /** @param {Buffer} msg */ (msg) => {
+        if (gotHello) return // duplicate Hello, ignore
         const hello = Hello.decode(msg)
         if (hello.protocolVersion !== AUTH_PROTOCOL_VERSION) {
           logger.log(
@@ -664,16 +712,55 @@ async function identityHandshake(socket, protomux, identityKeypair, logger) {
             remotePublicKeyString,
             hello.protocolVersion
           )
-          helloDefer.reject(new AuthProtocolVersionMismatchError())
+          done.reject(new AuthProtocolVersionMismatchError())
           return
         }
-        helloDefer.resolve(hello)
+        gotHello = true
+        // Versions agree: prove our identity. Sent here, synchronously, so
+        // that our proof precedes anything we write after authenticating.
+        const sig = new Uint8Array(64)
+        sodium.crypto_sign_detached(
+          sig,
+          socket.handshakeHash,
+          identityKeypair.secretKey
+        )
+        const proof = IdentityProof.encode({
+          publicKey: identityKeypair.publicKey,
+          signature: Buffer.from(sig),
+        }).finish()
+        authChannel.messages[1].send(Buffer.from(proof))
       },
     },
     {
       encoding: cenc.raw,
       onmessage: /** @param {Buffer} msg */ (msg) => {
-        identityDefer.resolve(IdentityProof.decode(msg))
+        if (!gotHello) {
+          // Proof before Hello: not a peer speaking this protocol
+          done.reject(new InvalidIdentityProofError())
+          return
+        }
+        const peerProof = IdentityProof.decode(msg)
+        let valid
+        try {
+          valid = sodium.crypto_sign_verify_detached(
+            peerProof.signature,
+            socket.handshakeHash,
+            peerProof.publicKey
+          )
+        } catch {
+          valid = false
+        }
+        if (!valid) {
+          done.reject(new InvalidIdentityProofError())
+          return
+        }
+        try {
+          onAuthenticated(Buffer.from(peerProof.publicKey))
+        } catch (e) {
+          done.reject(e)
+          return
+        }
+        done.resolve()
       },
     },
   ]
@@ -681,65 +768,20 @@ async function identityHandshake(socket, protomux, identityKeypair, logger) {
   const authChannel = protomux.createChannel({
     protocol: AUTH_PROTOCOL,
     messages,
-    onopen: () => onAuthOpen.resolve(),
-    ondrain: () => drainDefer?.resolve(),
+    onopen: () => {
+      const myHello = Hello.encode({
+        protocolVersion: AUTH_PROTOCOL_VERSION,
+      }).finish()
+      authChannel.messages[0].send(Buffer.from(myHello))
+    },
+    onclose: () => done.reject(new InviteRedeemConnectionClosedError()),
   })
   if (!authChannel) throw new InviteRedeemConnectionClosedError()
   authChannel.open()
-  await onAuthOpen.promise
 
-  /**
-   * @param {Buffer} buf
-   * @param {number} messageId
-   */
-  const sendAndDrain = async (buf, messageId) => {
-    drainDefer = pDefer()
-    const didWrite = authChannel.messages[messageId].send(buf)
-    if (!didWrite) await drainDefer.promise
-  }
-
-  // Send our hello
-  const myHello = Hello.encode({
-    protocolVersion: AUTH_PROTOCOL_VERSION,
-  }).finish()
-  await sendAndDrain(Buffer.from(myHello), 0)
-
-  // Receive peer's hello
-  await timeoutPromise(helloDefer.promise, {
+  return timeoutPromise(done.promise, {
     milliseconds: AUTH_HANDSHAKE_TIMEOUT,
   })
-
-  // Send our identity proof
-  const sig = new Uint8Array(64)
-  sodium.crypto_sign_detached(
-    sig,
-    socket.handshakeHash,
-    identityKeypair.secretKey
-  )
-  const myProof = IdentityProof.encode({
-    publicKey: identityKeypair.publicKey,
-    signature: Buffer.from(sig),
-  }).finish()
-  await sendAndDrain(Buffer.from(myProof), 1)
-
-  // Receive and verify peer's identity proof
-  const peerProof = await timeoutPromise(identityDefer.promise, {
-    milliseconds: AUTH_HANDSHAKE_TIMEOUT,
-  })
-
-  let valid
-  try {
-    valid = sodium.crypto_sign_verify_detached(
-      peerProof.signature,
-      socket.handshakeHash,
-      peerProof.publicKey
-    )
-  } catch {
-    valid = false
-  }
-  if (!valid) throw new InvalidIdentityProofError()
-
-  return Buffer.from(peerProof.publicKey)
 }
 
 /**

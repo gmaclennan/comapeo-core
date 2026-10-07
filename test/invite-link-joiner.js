@@ -86,7 +86,7 @@ function mockDiscovery(connection) {
       redeemCalls.push(redeem)
       await redeemAcked.promise
     },
-    async waitForAdmission(_connection, { signal } = {}) {
+    async waitForAdmission(_connection, _inviteId, { signal } = {}) {
       signal?.throwIfAborted()
       await Promise.race([
         admission.promise,

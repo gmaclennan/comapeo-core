@@ -561,12 +561,6 @@ export const InvalidInternetInviteURLError = createErrorClass({
   status: 400,
 })
 
-export const InviteAlreadyRedeemedError = createErrorClass({
-  code: 'INVITE_ALREADY_REDEEMED_ERROR',
-  message: 'Invite already redeemed',
-  status: 409,
-})
-
 export const UnknownInviteIDRedeemAttemptError = createErrorClass({
   code: 'UNKNOWN_INVITE_ID_REDEEM_ATTEMPT_ERROR',
   message: 'Unknown invite ID redeem attempt',

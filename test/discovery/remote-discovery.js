@@ -18,7 +18,10 @@ import {
   AuthProtocolVersionMismatchError,
   ensureKnownError,
   InvalidIdentityProofError,
+  InviteDeniedByInviterError,
+  InviteRedeemConnectionClosedError,
 } from '../../src/errors.js'
+import { randomBytes } from 'node:crypto'
 import pDefer from 'p-defer'
 
 /** @import {OpenedNoiseStream} from '../../src/lib/noise-secret-stream-helpers.js'*/
@@ -564,3 +567,174 @@ test('RemoteDiscovery - valid auth handshake completes and emits authenticated',
 function handleConnectionError(e) {
   assert.fail(`Unexpected connection error: ${e.message}`)
 }
+
+/**
+ * Two RemoteDiscovery instances on a testnet, with the second connected to
+ * the first and both sides authenticated.
+ *
+ * @param {import('node:test').TestContext} t
+ */
+async function connectedPair(t) {
+  const testnet = await createTestnet(3)
+  t.after(() => testnet.destroy())
+
+  const invitorIdentity = new KeyManager(
+    Buffer.alloc(16, 11)
+  ).getIdentityKeypair()
+  const inviteeIdentity = new KeyManager(
+    Buffer.alloc(16, 12)
+  ).getIdentityKeypair()
+  const invitorSwarm = new KeyManager(Buffer.alloc(16, 13)).getIdentityKeypair()
+  const inviteeSwarm = new KeyManager(Buffer.alloc(16, 14)).getIdentityKeypair()
+
+  const invitor = new RemoteDiscovery({
+    identityKeypair: invitorIdentity,
+    deriveSwarmIdentityKeypair: () => invitorSwarm,
+    swarm: { dht: testnet.nodes[0] },
+  })
+  const invitee = new RemoteDiscovery({
+    identityKeypair: inviteeIdentity,
+    deriveSwarmIdentityKeypair: () => inviteeSwarm,
+    swarm: { dht: testnet.nodes[1] },
+  })
+  t.after(() => Promise.all([invitor.close(), invitee.close()]))
+  await Promise.all([invitor.start(), invitee.start()])
+
+  const onInbound = pEvent(invitor, 'authenticated', { timeout: 10_000 })
+  const outbound = await invitee.connectPeer(
+    invitorSwarm.publicKey.toString('hex'),
+    { timeout: 10_000 }
+  )
+  const inbound = await onInbound
+  outbound.on('error', noop)
+  inbound.on('error', noop)
+
+  return {
+    invitor,
+    invitee,
+    outbound,
+    inbound,
+    inviteeDeviceId: inviteeIdentity.publicKey.toString('hex'),
+  }
+}
+
+function noop() {}
+
+test('RemoteDiscovery - redeem, admit: both sides emit connection', async (t) => {
+  const { invitor, invitee, outbound, inviteeDeviceId } = await connectedPair(t)
+  const inviteId = randomBytes(32)
+
+  const onRedeem = pEvent(invitor, 'redeem', {
+    multiArgs: true,
+    timeout: 5000,
+  })
+  const onInvitorConnection = pEvent(invitor, 'connection', { timeout: 5000 })
+  const onInviteeConnection = pEvent(invitee, 'connection', { timeout: 5000 })
+
+  await invitee.redeem(outbound, {
+    inviteId,
+    deviceName: 'invitee',
+    deviceType: 'mobile',
+  })
+  const admission = invitee.waitForAdmission(outbound, inviteId)
+
+  const [deviceId, redeem] =
+    /** @type {[string, import('../../src/generated/invite-link.js').Redeem]} */ (
+      /** @type {unknown} */ (await onRedeem)
+    )
+  assert.equal(deviceId, inviteeDeviceId)
+  assert.ok(redeem.inviteId.equals(inviteId))
+  assert.equal(redeem.deviceName, 'invitee')
+
+  assert.equal(await invitor.admit(deviceId, inviteId), true)
+  await admission
+  const [invitorConn, inviteeConn] = await Promise.all([
+    onInvitorConnection,
+    onInviteeConnection,
+  ])
+  assert.ok(
+    invitorConn.authenticatedPublicKey.equals(Buffer.from(deviceId, 'hex'))
+  )
+  assert.ok(
+    inviteeConn === outbound,
+    'invitee connection is the outbound stream'
+  )
+})
+
+test('RemoteDiscovery - deny rejects the wait with the reason and closes', async (t) => {
+  const { invitor, invitee, outbound, inviteeDeviceId } = await connectedPair(t)
+  const inviteId = randomBytes(32)
+
+  const onRedeem = pEvent(invitor, 'redeem', { multiArgs: true, timeout: 5000 })
+  await invitee.redeem(outbound, {
+    inviteId,
+    deviceName: '',
+    deviceType: 'device_type_unspecified',
+  })
+  const admission = invitee.waitForAdmission(outbound, inviteId)
+  admission.catch(noop)
+  await onRedeem
+
+  const onClose = pEvent(outbound, 'close', { timeout: 5000 })
+  await invitor.deny(inviteeDeviceId, inviteId, 'invitor_denied')
+
+  await assert.rejects(admission, { code: InviteDeniedByInviterError.code })
+  await onClose
+})
+
+test('RemoteDiscovery - a deny for one invite does not decide another on the same connection', async (t) => {
+  const { invitor, invitee, outbound, inviteeDeviceId } = await connectedPair(t)
+  const inviteA = randomBytes(32)
+  const inviteB = randomBytes(32)
+
+  /** @type {Buffer[]} */
+  const redeemed = []
+  invitor.on('redeem', (_deviceId, redeem) => redeemed.push(redeem.inviteId))
+
+  await invitee.redeem(outbound, {
+    inviteId: inviteA,
+    deviceName: '',
+    deviceType: 'device_type_unspecified',
+  })
+  await invitee.redeem(outbound, {
+    inviteId: inviteB,
+    deviceName: '',
+    deviceType: 'device_type_unspecified',
+  })
+  const waitA = invitee.waitForAdmission(outbound, inviteA)
+  const waitB = invitee.waitForAdmission(outbound, inviteB)
+  waitA.catch(noop)
+  waitB.catch(noop)
+  assert.equal(redeemed.length, 2, 'invitor saw both redeems')
+
+  // Deny A without closing: send the deny on the channel directly by denying
+  // and then checking B is still pending before the socket closes
+  let bSettled = false
+  waitB.then(
+    () => (bSettled = true),
+    () => (bSettled = true)
+  )
+  // deny() closes the connection after the ack, which would also reject B,
+  // so observe A's rejection first via the deny message itself
+  const denyPromise = invitor.deny(inviteeDeviceId, inviteA, 'invitor_denied')
+  await assert.rejects(waitA, { code: InviteDeniedByInviterError.code })
+  assert.equal(bSettled, false, 'B is not decided by a deny of A')
+  await denyPromise
+  await assert.rejects(waitB, { code: InviteRedeemConnectionClosedError.code })
+})
+
+test('RemoteDiscovery - repeated redeem is acknowledged and emitted again', async (t) => {
+  const { invitor, invitee, outbound } = await connectedPair(t)
+  const inviteId = randomBytes(32)
+  let redeems = 0
+  invitor.on('redeem', () => redeems++)
+
+  const redeem = {
+    inviteId,
+    deviceName: '',
+    deviceType: /** @type {const} */ ('device_type_unspecified'),
+  }
+  await invitee.redeem(outbound, redeem)
+  await invitee.redeem(outbound, redeem)
+  assert.equal(redeems, 2)
+})

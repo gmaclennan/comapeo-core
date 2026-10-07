@@ -202,8 +202,9 @@ export class InviteLinkJoiner extends TypedEmitter {
       // Requested: the invitor has our request and its user is deciding
       this.#setStatus(joinRequest, 'requested')
 
-      // Resolves when admitted, rejects on deny, disconnect or cancel
-      await this.#discovery.waitForAdmission(connection, { signal })
+      // Resolves when this invite is admitted, rejects on deny of this
+      // invite, disconnect or cancel
+      await this.#discovery.waitForAdmission(connection, inviteId, { signal })
 
       // Accepted: we are admitted, the regular invite follows over RPC
       this.#setStatus(joinRequest, 'accepted')

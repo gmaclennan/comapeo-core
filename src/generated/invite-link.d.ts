@@ -5,19 +5,23 @@ export interface Redeem {
     inviteId: Buffer;
     /** Display info so the invitor can show who is asking before deciding */
     deviceName: string;
+    /** 15: kept free for a request id, see the file comment */
     deviceType: DeviceInfo_DeviceType;
 }
 /** Invitor -> invitee: the redeem request was received and is awaiting a decision */
 export interface RedeemAck {
+    /** 15: kept free for a request id, see the file comment */
     inviteId: Buffer;
 }
 /** Invitor -> invitee: admission granted, both sides open the RPC channel */
 export interface Admit {
+    /** 15: kept free for a request id, see the file comment */
     inviteId: Buffer;
 }
 /** Invitor -> invitee: admission refused */
 export interface Deny {
     inviteId: Buffer;
+    /** 15: kept free for a request id, see the file comment */
     reason: Deny_DenyReason;
 }
 export declare const Deny_DenyReason: {
@@ -31,6 +35,7 @@ export declare function deny_DenyReasonFromJSON(object: any): Deny_DenyReason;
 export declare function deny_DenyReasonToNumber(object: Deny_DenyReason): number;
 /** Invitee -> invitor: the deny was received, the invitor may now close */
 export interface DenyAck {
+    /** 15: kept free for a request id, see the file comment */
     inviteId: Buffer;
 }
 export declare const Redeem: {

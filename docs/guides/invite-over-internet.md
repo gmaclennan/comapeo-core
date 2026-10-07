@@ -41,6 +41,9 @@ network.
 ## Invitor Flow
 
 ```JavaScript
+// May fire again for the same deviceId and inviteId if the invitee repeats
+// its request (e.g. after a dropped connection): treat that as a refresh of
+// the same pending request, not a new one
 manager.on('invite-link-join-request', async (projectId, deviceId, inviteId,) => {
   const project = await manager.getProject(projectId)
 

@@ -56,8 +56,7 @@ import {
  */
 
 // Unique identifier for the mapeo rpc protocol
-/** Name of the RPC protomux protocol. Part of the wire format, never change. */
-export const PROTOCOL_NAME = 'mapeo/rpc'
+const PROTOCOL_NAME = 'mapeo/rpc'
 // Timeout in milliseconds to wait for a peer to connect when trying to send a message
 const SEND_TIMEOUT = 1000
 // Timeout in milliseconds to wait for peer deduplication

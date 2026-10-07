@@ -38,7 +38,6 @@ import {
   UnknownPeerError,
   PeerDisconnectedError,
   InvalidInternetInviteURLError,
-  InviteAlreadyRedeemedError,
   InviteNotYetRedeemedError,
   PeerDisconnectedSinceRedeemingInviteError,
   UnknownInviteIDError,
@@ -365,13 +364,16 @@ export class MemberApi extends TypedEmitter {
 
     const redeemedSet = this.#redeemedInvites.get(inviteIdString)
     if (redeemedSet?.has(peerId)) {
+      // A repeated redeem (a retry after a dropped connection, or a second
+      // tap on the link) is the same request, not a new one: the channel has
+      // acknowledged it again and the app is told again so it can refresh
+      // whatever it shows for this pending request
       this.#l.log(
-        'Incoming invite was already redeemed, disconnecting',
-        inviteIdString.slice(0, 7)
+        'Repeated redeem of %S from %S',
+        inviteIdString.slice(0, 7),
+        peerId
       )
-      await this.#remoteDiscovery.disconnectPeer(peerId)
-
-      throw new InviteAlreadyRedeemedError()
+      return inviteIdString
     }
 
     if (!redeemedSet) {
