@@ -15,7 +15,10 @@ A remote connection goes through three stages before the invitee is a member:
    before the connection closes. A remote peer that neither redeems nor is
    admitted within `admissionTimeout` is disconnected.
 3. **Invite**: once admitted the usual invite flow runs over RPC: invite,
-   response, project join details, initial sync.
+   response, project join details, initial sync. The connection stays open
+   after the invitee reports `completed`, because the invitor's own initial
+   sync with the new member may still be finishing; it closes when either
+   side's swarm stops.
 
 Other open projects on either device will sync with the peer once it is
 admitted and the usual role checks pass, exactly as for a peer on the local

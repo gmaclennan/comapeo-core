@@ -224,11 +224,13 @@ export class InviteLinkJoiner extends TypedEmitter {
 
       const projectId = await this.#inviteApi.accept(invite)
 
-      // Completed
+      // Completed. The connection is deliberately left open: our initial sync
+      // being done does not mean the invitor's is (it still wants our initial
+      // data and checks our role before it considers us joined), and we are
+      // now a member, so this is an ordinary sync connection. It closes when
+      // either side stops its swarm or the app closes.
       joinRequest.projectId = projectId
       this.#setStatus(joinRequest, 'completed')
-
-      connection.end()
     } catch (e) {
       joinRequest.error = wrapNetworkError(e)
       this.#setStatus(joinRequest, 'failed')
@@ -240,8 +242,10 @@ export class InviteLinkJoiner extends TypedEmitter {
         // ignore disconnect errors
       }
     } finally {
-      // Hyperswarm keeps redialling a joined peer until we leave it. The
-      // connection was only needed for the invite, so stop here.
+      // Hyperswarm keeps redialling a joined peer until we leave it. Stop the
+      // redials now (any open connection stays open); if it drops later the
+      // invitor remembers our admission for a while and project discovery
+      // over the swarm, when it exists, is the way to reconnect.
       this.#discovery.leavePeer(swarmPublicKey)
       this.#pending.delete(inviteIdString)
     }
