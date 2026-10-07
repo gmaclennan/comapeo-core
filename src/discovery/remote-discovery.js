@@ -3,18 +3,15 @@ import { Logger } from '../logger.js'
 import Hyperswarm from 'hyperswarm'
 import StartStopStateMachine from 'start-stop-state-machine'
 import { pEvent, TimeoutError as EventTimeoutError } from 'p-event'
-import sodium from 'sodium-universal'
 import Protomux from 'protomux'
-import cenc from 'compact-encoding'
 import pDefer from 'p-defer'
 import timingSafeEqual from 'string-timing-safe-equal'
-import { noop, timeoutPromise } from '../utils.js'
-import { Hello, IdentityProof } from '../generated/auth.js'
+import { noop } from '../utils.js'
+import { abortable } from '../lib/abortable.js'
+import { identityHandshake } from './identity-handshake.js'
 import { InviteLinkChannel } from '../invite/invite-link-channel.js'
 import {
-  AuthProtocolVersionMismatchError,
   ensureKnownError,
-  InvalidIdentityProofError,
   InviteDeniedByInviterError,
   InviteLinkNotRequestedError,
   InviteLinkRequestPendingError,
@@ -47,10 +44,6 @@ export const kTestOnlyHandleHyperswarmConnection = Symbol(
   'testOnlyHandleHyperswarmConnection'
 )
 
-export const AUTH_PROTOCOL = 'comapeo/auth'
-const AUTH_PROTOCOL_VERSION = 1
-const AUTH_HANDSHAKE_TIMEOUT = 10_000
-
 /**
  * How long an authenticated peer has to redeem an invite link (or be admitted
  * for another reason) before we close the connection. Once a redeem has been
@@ -72,8 +65,8 @@ const ADMITTED_TTL = 5 * 60_000
 
 /**
  * An invite link we have asked the peer on a connection to redeem, and the
- * peer's decision on it. One per connection: a connection carries at most one
- * request awaiting a decision at a time.
+ * peer's decision on it. A connection carries at most one request awaiting a
+ * decision at a time.
  *
  * @typedef {object} InviteLinkRequest
  * @property {Buffer} inviteId
@@ -82,7 +75,7 @@ const ADMITTED_TTL = 5 * 60_000
  */
 
 /**
- * Per-connection state owned by RemoteDiscovery. A connection climbs
+ * Per-connection state. A connection climbs
  * handshaking → authenticated → admitted, or is closed on the way.
  */
 class RemoteConnection {
@@ -93,10 +86,6 @@ class RemoteConnection {
   identityPublicKey = null
   /** @type {InviteLinkChannel | null} */
   inviteLink = null
-  /** @type {ReturnType<typeof setTimeout> | null} */
-  admissionTimer = null
-  /** True once the peer has sent us a redeem, or we have had ours acked */
-  awaitingDecision = false
   /** @type {DeferredPromise<void>} resolves when authenticated, rejects on failure */
   authenticated = pDefer()
   /**
@@ -104,13 +93,15 @@ class RemoteConnection {
    * matches it means anything: an Admit we never asked for is not admission.
    * @type {InviteLinkRequest | null}
    */
-  request = null
+  outgoingRequest = null
   /**
-   * The invite the peer has asked us to redeem (the latest one), so that
-   * `admit()`/`deny()` only answer connections that actually asked.
+   * The invite this peer has asked us to redeem (the latest one), so that
+   * `admit()` and `deny()` only answer connections that actually asked.
    * @type {Buffer | null}
    */
-  receivedRedeem = null
+  incomingInviteId = null
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  #admissionTimer = null
 
   /** @param {OpenedNoiseStream} socket */
   constructor(socket) {
@@ -123,28 +114,59 @@ class RemoteConnection {
     return this.identityPublicKey?.toString('hex')
   }
 
+  /**
+   * @param {number} ms
+   * @param {() => void} onExpire
+   */
+  armAdmissionTimer(ms, onExpire) {
+    this.disarmAdmissionTimer()
+    this.#admissionTimer = setTimeout(onExpire, ms)
+    this.#admissionTimer.unref()
+  }
+
+  disarmAdmissionTimer() {
+    if (this.#admissionTimer !== null) clearTimeout(this.#admissionTimer)
+    this.#admissionTimer = null
+  }
+
   /** @param {Buffer} inviteId */
   startRequest(inviteId) {
     const decision = pDefer()
     decision.promise.catch(noop)
-    this.request = { inviteId, decision, settled: false }
+    this.outgoingRequest = { inviteId, decision, settled: false }
   }
 
   /** @param {Buffer} inviteId */
   hasPendingRequestFor(inviteId) {
+    const request = this.outgoingRequest
     return (
-      this.request !== null &&
-      !this.request.settled &&
-      timingSafeEqual(this.request.inviteId, inviteId)
+      request !== null &&
+      !request.settled &&
+      timingSafeEqual(request.inviteId, inviteId)
     )
   }
 
   /** @param {Error} [error] */
   settleRequest(error) {
-    if (!this.request || this.request.settled) return
-    this.request.settled = true
-    if (error) this.request.decision.reject(error)
-    else this.request.decision.resolve()
+    const request = this.outgoingRequest
+    if (!request || request.settled) return
+    request.settled = true
+    if (error) request.decision.reject(error)
+    else request.decision.resolve()
+  }
+
+  /**
+   * @param {Error} reason
+   * @returns {boolean} false if already closed
+   */
+  close(reason) {
+    if (this.state === 'closed') return false
+    this.disarmAdmissionTimer()
+    this.state = 'closed'
+    this.authenticated.reject(reason)
+    this.settleRequest(reason)
+    this.inviteLink?.close()
+    return true
   }
 }
 
@@ -288,7 +310,7 @@ export class RemoteDiscovery extends TypedEmitter {
 
   async close() {
     for (const conn of this.#connections.values()) {
-      this.#clearAdmissionTimer(conn)
+      conn.disarmAdmissionTimer()
     }
     await this.#swarm?.destroy()
     this.#l.log('Closed swarm')
@@ -302,25 +324,22 @@ export class RemoteDiscovery extends TypedEmitter {
   }
 
   /**
-   * Disconnect from a peer by their swarm (NOISE) public key or their identity
-   * public key.
-   * @param {string} publicKey
+   * Close every connection to a device.
+   * @param {string} deviceId identity public key as hex
    */
-  async disconnectPeer(publicKey) {
-    const key = Buffer.from(publicKey, 'hex')
-
-    for (const conn of this.#connections.values()) {
-      if (
-        conn.socket.remotePublicKey?.equals(key) ||
-        conn.identityPublicKey?.equals(key)
-      ) {
-        this.#l.log('Disconnecting from peer %S', publicKey)
-        conn.socket.end()
-        await pEvent(conn.socket, 'close')
-        return
-      }
+  async disconnectPeer(deviceId) {
+    const conns = this.#findByIdentity(deviceId)
+    if (conns.length === 0) {
+      this.#l.log('Cannot disconnect from peer %S, not connected', deviceId)
+      return
     }
-    this.#l.log('Cannot disconnect from peer %S, not connected', publicKey)
+    this.#l.log('Disconnecting from peer %S', deviceId)
+    await Promise.all(
+      conns.map(async ({ socket }) => {
+        socket.end()
+        await pEvent(socket, 'close')
+      })
+    )
   }
 
   /**
@@ -352,11 +371,7 @@ export class RemoteDiscovery extends TypedEmitter {
     const existing = await this.#findExistingPeer(noisePublicKey)
     if (existing) return existing
 
-    const onAbort = () => {
-      this.#l.log('Leave peer for %s', publicKey)
-      swarm.leavePeer(noisePublicKey)
-    }
-
+    const onAbort = () => swarm.leavePeer(noisePublicKey)
     const onAuthenticated = pEvent(this, 'authenticated', {
       filter: (connection) => connection.remotePublicKey.equals(noisePublicKey),
       timeout,
@@ -366,14 +381,12 @@ export class RemoteDiscovery extends TypedEmitter {
       rejectionEvents: [],
     })
 
-    // Start trying to connect
     swarm.joinPeer(noisePublicKey)
     this.#l.log('Connecting to %S', publicKey)
     signal?.addEventListener('abort', onAbort, { once: true })
     try {
       return await onAuthenticated
     } catch (e) {
-      // We should stop trying to connect if we time out
       swarm.leavePeer(noisePublicKey)
       if (e instanceof EventTimeoutError) {
         throw new TimeoutError('Timed out waiting for peer')
@@ -398,15 +411,13 @@ export class RemoteDiscovery extends TypedEmitter {
    */
   async redeem(socket, redeem) {
     const conn = this.#getAuthenticatedConnection(socket)
-    const { request } = conn
+    const request = conn.outgoingRequest
     if (request && !request.settled) {
       if (!timingSafeEqual(request.inviteId, redeem.inviteId)) {
         throw new InviteLinkRequestPendingError()
       }
       // Same invite: a retry of the pending request, keep its decision
     } else {
-      // A fresh request: a previous decision on this connection, if any, was
-      // about a previous request and must not answer this one
       conn.startRequest(redeem.inviteId)
     }
     try {
@@ -416,8 +427,7 @@ export class RemoteDiscovery extends TypedEmitter {
       throw e
     }
     // The invitor has the request; from here on we wait on a human, not a timer
-    conn.awaitingDecision = true
-    this.#clearAdmissionTimer(conn)
+    conn.disarmAdmissionTimer()
   }
 
   /**
@@ -434,25 +444,11 @@ export class RemoteDiscovery extends TypedEmitter {
    * @returns {Promise<void>}
    */
   async waitForAdmission(socket, inviteId, { signal } = {}) {
-    const conn = this.#getAuthenticatedConnection(socket)
-    const { request } = conn
+    const request = this.#getAuthenticatedConnection(socket).outgoingRequest
     if (!request || !timingSafeEqual(request.inviteId, inviteId)) {
       throw new InviteLinkNotRequestedError()
     }
-    const decision = request.decision.promise
-    if (!signal) return decision
-    signal.throwIfAborted()
-    /** @type {() => void} */
-    let onAbort = noop
-    const abortPromise = new Promise((_, reject) => {
-      onAbort = () => reject(signal.reason)
-      signal.addEventListener('abort', onAbort, { once: true })
-    })
-    try {
-      await Promise.race([decision, abortPromise])
-    } finally {
-      signal.removeEventListener('abort', onAbort)
-    }
+    return abortable(request.decision.promise, signal)
   }
 
   /**
@@ -466,24 +462,10 @@ export class RemoteDiscovery extends TypedEmitter {
    */
   async admit(deviceId, inviteId) {
     let delivered = false
-    for (const conn of this.#findByIdentity(deviceId)) {
-      if (
-        !conn.receivedRedeem ||
-        !timingSafeEqual(conn.receivedRedeem, inviteId)
-      ) {
-        continue
-      }
-      // Write Admit and admit on our side in the same tick, so that the RPC
-      // pairing LocalPeers registers on `connection` exists before anything
-      // the peer sends in response can be processed. Always tell the peer,
-      // even if we already admitted this connection on our side (a recently
-      // admitted device, or a member asking for another link): the peer is
-      // waiting for the decision on this invite.
-      if (!conn.inviteLink?.trySendAdmit({ inviteId })) {
-        this.#l.log('Could not send admit to %S: channel closed', deviceId)
-        continue
-      }
-      this.#admit(conn)
+    for (const conn of this.#connectionsAskingFor(deviceId, inviteId)) {
+      // Write Admit, then admit on our side in the same tick (see class comment)
+      if (!conn.inviteLink?.trySendAdmit({ inviteId })) continue
+      this.#markAdmitted(conn)
       delivered = true
     }
     return delivered
@@ -492,8 +474,7 @@ export class RemoteDiscovery extends TypedEmitter {
   /**
    * Deny a device that has asked to redeem an invite link. Sends `Deny`, waits
    * for the peer to acknowledge it (or the ack timeout), then closes the
-   * connection unless the peer is an admitted member, who keeps its
-   * connection.
+   * connection unless the peer is an admitted member, who keeps it.
    *
    * @param {string} deviceId identity public key as hex
    * @param {Buffer} inviteId
@@ -501,21 +482,14 @@ export class RemoteDiscovery extends TypedEmitter {
    * @returns {Promise<void>}
    */
   async deny(deviceId, inviteId, reason) {
-    for (const conn of this.#findByIdentity(deviceId)) {
-      if (
-        !conn.receivedRedeem ||
-        !timingSafeEqual(conn.receivedRedeem, inviteId)
-      ) {
-        continue
-      }
-      conn.receivedRedeem = null
+    for (const conn of this.#connectionsAskingFor(deviceId, inviteId)) {
+      conn.incomingInviteId = null
       try {
         await conn.inviteLink?.sendDeny({ inviteId, reason })
       } catch (e) {
         this.#l.log('Failed to send deny to %S: %s', deviceId, e)
       }
-      if (conn.state === 'admitted') continue
-      conn.socket.end()
+      if (conn.state !== 'admitted') conn.socket.end()
     }
   }
 
@@ -531,6 +505,18 @@ export class RemoteDiscovery extends TypedEmitter {
       }
     }
     return result
+  }
+
+  /**
+   * Connections from a device whose latest redeem was for this invite
+   * @param {string} deviceId
+   * @param {Buffer} inviteId
+   */
+  #connectionsAskingFor(deviceId, inviteId) {
+    return this.#findByIdentity(deviceId).filter(
+      ({ incomingInviteId }) =>
+        incomingInviteId !== null && timingSafeEqual(incomingInviteId, inviteId)
+    )
   }
 
   /**
@@ -568,29 +554,6 @@ export class RemoteDiscovery extends TypedEmitter {
     return null
   }
 
-  /** @param {RemoteConnection} conn */
-  #clearAdmissionTimer(conn) {
-    if (conn.admissionTimer === null) return
-    clearTimeout(conn.admissionTimer)
-    conn.admissionTimer = null
-  }
-
-  /** @param {RemoteConnection} conn */
-  #startAdmissionTimer(conn) {
-    this.#clearAdmissionTimer(conn)
-    conn.admissionTimer = setTimeout(() => {
-      conn.admissionTimer = null
-      if (conn.state === 'admitted' || conn.awaitingDecision) return
-      this.#l.log(
-        'Peer %S was not admitted within %d ms, disconnecting',
-        conn.identityHex,
-        this.#admissionTimeout
-      )
-      conn.socket.end()
-    }, this.#admissionTimeout)
-    conn.admissionTimer.unref()
-  }
-
   /**
    * @param {string} deviceId
    * @returns {boolean}
@@ -605,8 +568,7 @@ export class RemoteDiscovery extends TypedEmitter {
 
   /**
    * Called synchronously from the identity-proof message handler once the
-   * peer's proof has been verified (see the class comment for why this must
-   * not run in an `await` continuation).
+   * peer's proof has been verified (see the class comment).
    *
    * @param {RemoteConnection} conn
    * @param {Buffer} identityPublicKey
@@ -629,17 +591,20 @@ export class RemoteDiscovery extends TypedEmitter {
       // which is harmless: the peer has nothing to resume, and its own
       // admission timeout closes the connection shortly after.
       this.#l.log('Re-admitting recently admitted peer %S', deviceId)
-      this.#admit(conn)
+      this.#markAdmitted(conn)
       return
     }
-    this.#startAdmissionTimer(conn)
+    conn.armAdmissionTimer(this.#admissionTimeout, () => {
+      this.#l.log('Peer %S did not redeem an invite in time', deviceId)
+      socket.end()
+    })
   }
 
   /** @param {RemoteConnection} conn */
-  #admit(conn) {
+  #markAdmitted(conn) {
     if (conn.state !== 'authenticated') return
     conn.state = 'admitted'
-    this.#clearAdmissionTimer(conn)
+    conn.disarmAdmissionTimer()
     const deviceId = conn.identityHex
     if (deviceId) this.#admittedDevices.set(deviceId, Date.now() + ADMITTED_TTL)
     this.#l.log('Admitted peer %S', deviceId)
@@ -656,13 +621,8 @@ export class RemoteDiscovery extends TypedEmitter {
    */
   #closeConnection(conn, reason) {
     this.#connections.delete(conn.socket)
-    this.#clearAdmissionTimer(conn)
-    if (conn.state === 'closed') return
     const deviceId = conn.identityHex
-    conn.state = 'closed'
-    conn.authenticated.reject(reason)
-    conn.settleRequest(reason)
-    conn.inviteLink?.close()
+    if (!conn.close(reason)) return
     // Only the last connection to a device counts as the device going away
     if (deviceId && this.#findByIdentity(deviceId).length === 0) {
       this.emit('peer-closed', deviceId)
@@ -680,62 +640,13 @@ export class RemoteDiscovery extends TypedEmitter {
     socket.once('close', onClose)
     socket.once('finish', onClose)
     try {
-      // Wait for the NOISE handshake to complete
-      const opened = await socket.opened
-      if (!opened || socket.destroyed) return
-
-      // Create protomux and store on the stream so LocalPeers can reuse it
+      if (!(await socket.opened) || socket.destroyed) return
+      // Store protomux on the stream so LocalPeers can reuse it
       const protomux = Protomux.from(socket)
       socket.userData = protomux
-
-      // The invite-link channel is created now, alongside the auth channel,
-      // because the peer may open it as soon as its own handshake completes.
-      // Nothing on it means anything until the peer has proven its identity.
-      const inviteLink = new InviteLinkChannel(protomux, {
-        logger: this.#l,
-        acceptRedeem: () =>
-          conn.state === 'authenticated' || conn.state === 'admitted',
-      })
-      conn.inviteLink = inviteLink
-      inviteLink.on('redeem', (redeem) => {
-        // A redeem is a request to join a project, which stands whether or not
-        // this connection is already admitted (e.g. a recently admitted device
-        // retrying after a failed join, or a member asking for another link)
-        conn.receivedRedeem = redeem.inviteId
-        // The invitor's user now has to decide, which can take a while
-        conn.awaitingDecision = true
-        this.#clearAdmissionTimer(conn)
-        this.emit('redeem', /** @type {string} */ (conn.identityHex), redeem)
-      })
-      inviteLink.on('admit', ({ inviteId }) => {
-        if (!conn.hasPendingRequestFor(inviteId)) {
-          // We did not ask to redeem this. Only a redeem we sent can lead to
-          // admission, so an unasked-for Admit comes from a peer that is not
-          // following the protocol: drop the connection.
-          this.#l.log(
-            'Unsolicited admit from %S, disconnecting',
-            conn.identityHex
-          )
-          conn.socket.end()
-          return
-        }
-        this.#admit(conn)
-        conn.settleRequest()
-      })
-      inviteLink.on('deny', (deny) => {
-        if (!conn.hasPendingRequestFor(deny.inviteId)) {
-          this.#l.log('Ignoring deny from %S: not requested', conn.identityHex)
-          return
-        }
-        this.#l.log('Denied by %S: %s', conn.identityHex, deny.reason)
-        conn.settleRequest(denyToError(deny))
-      })
-      inviteLink.on('close', () => {
-        // Peer closed (or rejected) the invite-link channel: no decision on
-        // anything redeemed over it can arrive any more
-        conn.settleRequest(new InviteRedeemConnectionClosedError())
-      })
-
+      // Both channels the peer may open before admission must exist before
+      // its first message can arrive (see class comment)
+      this.#attachInviteLink(conn, protomux)
       await identityHandshake(
         socket,
         protomux,
@@ -750,128 +661,71 @@ export class RemoteDiscovery extends TypedEmitter {
       this.emit('error', error)
     }
   }
-}
 
-/**
- * Run the `comapeo/auth` handshake on a freshly opened NOISE stream: exchange
- * Hello messages, then exchange identity proofs.
- *
- * The handshake is driven by the message handlers rather than by sequential
- * awaits: our proof is sent inside the Hello handler and `onAuthenticated` is
- * called inside the proof handler, so that each step completes before protomux
- * moves on to the peer's next message. The returned promise only reports the
- * outcome (and enforces the timeout); it resolves after `onAuthenticated` has
- * run.
- *
- * @param {OpenedNoiseStream} socket
- * @param {Protomux<any>} protomux
- * @param {Keypair} identityKeypair
- * @param {Logger} logger
- * @param {(identityPublicKey: Buffer) => void} onAuthenticated
- * @returns {Promise<void>}
- */
-function identityHandshake(
-  socket,
-  protomux,
-  identityKeypair,
-  logger,
-  onAuthenticated
-) {
-  const remotePublicKeyString = socket.remotePublicKey.toString('hex')
-  /** @type {DeferredPromise<void>} */
-  const done = pDefer()
-  let gotHello = false
+  /**
+   * @param {RemoteConnection} conn
+   * @param {Protomux<any>} protomux
+   */
+  #attachInviteLink(conn, protomux) {
+    const inviteLink = new InviteLinkChannel(protomux, {
+      logger: this.#l,
+      // Nothing a peer says means anything until it has proven its identity
+      acceptRedeem: () =>
+        conn.state === 'authenticated' || conn.state === 'admitted',
+    })
+    inviteLink.on('redeem', (redeem) => this.#onPeerRedeem(conn, redeem))
+    inviteLink.on('admit', ({ inviteId }) => this.#onPeerAdmit(conn, inviteId))
+    inviteLink.on('deny', (deny) => this.#onPeerDeny(conn, deny))
+    inviteLink.on('close', () =>
+      conn.settleRequest(new InviteRedeemConnectionClosedError())
+    )
+    conn.inviteLink = inviteLink
+  }
 
-  const messages = [
-    {
-      encoding: cenc.raw,
-      onmessage: /** @param {Buffer} msg */ (msg) => {
-        if (gotHello) return // duplicate Hello, ignore
-        const hello = Hello.decode(msg)
-        if (hello.protocolVersion !== AUTH_PROTOCOL_VERSION) {
-          logger.log(
-            'Peer %s has incompatible protocol version %d',
-            remotePublicKeyString,
-            hello.protocolVersion
-          )
-          done.reject(new AuthProtocolVersionMismatchError())
-          return
-        }
-        gotHello = true
-        // Versions agree: prove our identity. Sent here, synchronously, so
-        // that our proof precedes anything we write after authenticating.
-        const sig = new Uint8Array(64)
-        sodium.crypto_sign_detached(
-          sig,
-          socket.handshakeHash,
-          identityKeypair.secretKey
-        )
-        const proof = IdentityProof.encode({
-          publicKey: identityKeypair.publicKey,
-          signature: Buffer.from(sig),
-        }).finish()
-        authChannel.messages[1].send(Buffer.from(proof))
-      },
-    },
-    {
-      encoding: cenc.raw,
-      onmessage: /** @param {Buffer} msg */ (msg) => {
-        if (!gotHello) {
-          // Proof before Hello: not a peer speaking this protocol
-          done.reject(new InvalidIdentityProofError())
-          return
-        }
-        const peerProof = IdentityProof.decode(msg)
-        let valid
-        try {
-          valid = sodium.crypto_sign_verify_detached(
-            peerProof.signature,
-            socket.handshakeHash,
-            peerProof.publicKey
-          )
-        } catch {
-          valid = false
-        }
-        if (!valid) {
-          done.reject(new InvalidIdentityProofError())
-          return
-        }
-        try {
-          onAuthenticated(Buffer.from(peerProof.publicKey))
-        } catch (e) {
-          done.reject(e)
-          return
-        }
-        done.resolve()
-      },
-    },
-  ]
+  /**
+   * @param {RemoteConnection} conn
+   * @param {Redeem} redeem
+   */
+  #onPeerRedeem(conn, redeem) {
+    // A redeem is a request to join a project, which stands whether or not
+    // this connection is already admitted (a recently admitted device
+    // retrying after a failed join, or a member asking for another link)
+    conn.incomingInviteId = redeem.inviteId
+    // The invitor's user now has to decide, which can take a while
+    conn.disarmAdmissionTimer()
+    this.emit('redeem', /** @type {string} */ (conn.identityHex), redeem)
+  }
 
-  const authChannel = protomux.createChannel({
-    protocol: AUTH_PROTOCOL,
-    messages,
-    onopen: () => {
-      const myHello = Hello.encode({
-        protocolVersion: AUTH_PROTOCOL_VERSION,
-      }).finish()
-      authChannel.messages[0].send(Buffer.from(myHello))
-    },
-    onclose: () => done.reject(new InviteRedeemConnectionClosedError()),
-  })
-  if (!authChannel) throw new InviteRedeemConnectionClosedError()
-  authChannel.open()
+  /**
+   * @param {RemoteConnection} conn
+   * @param {Buffer} inviteId
+   */
+  #onPeerAdmit(conn, inviteId) {
+    if (!conn.hasPendingRequestFor(inviteId)) {
+      // Only a redeem we sent can lead to admission, so an unasked-for Admit
+      // comes from a peer that is not following the protocol
+      this.#l.log('Unsolicited admit from %S, disconnecting', conn.identityHex)
+      conn.socket.end()
+      return
+    }
+    this.#markAdmitted(conn)
+    conn.settleRequest()
+  }
 
-  return timeoutPromise(done.promise, {
-    milliseconds: AUTH_HANDSHAKE_TIMEOUT,
-  })
-}
-
-/**
- * @param {Deny} deny
- * @returns {Error}
- */
-function denyToError(deny) {
-  return deny.reason === 'unknown_invite_id'
-    ? new UnknownInviteIDError()
-    : new InviteDeniedByInviterError({ reason: deny.reason })
+  /**
+   * @param {RemoteConnection} conn
+   * @param {Deny} deny
+   */
+  #onPeerDeny(conn, deny) {
+    if (!conn.hasPendingRequestFor(deny.inviteId)) {
+      this.#l.log('Ignoring deny from %S: not requested', conn.identityHex)
+      return
+    }
+    this.#l.log('Denied by %S: %s', conn.identityHex, deny.reason)
+    const error =
+      deny.reason === 'unknown_invite_id'
+        ? new UnknownInviteIDError()
+        : new InviteDeniedByInviterError({ reason: deny.reason })
+    conn.settleRequest(error)
+  }
 }

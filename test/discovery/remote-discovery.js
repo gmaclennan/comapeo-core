@@ -11,8 +11,8 @@ import { Duplex } from 'streamx'
 import {
   RemoteDiscovery,
   kTestOnlyHandleHyperswarmConnection,
-  AUTH_PROTOCOL,
 } from '../../src/discovery/remote-discovery.js'
+import { AUTH_PROTOCOL } from '../../src/discovery/identity-handshake.js'
 import { Hello, IdentityProof } from '../../src/generated/auth.js'
 import {
   AuthProtocolVersionMismatchError,
@@ -190,7 +190,6 @@ test('RemoteDiscovery - Able to reconnect after disconnecting', async (t) => {
   await Promise.all([remoteDiscovery1.start(), remoteDiscovery2.start()])
 
   const swarmPublicKey1Hex = swarmKeypair1.publicKey.toString('hex')
-  const swarmPublicKey2Hex = swarmKeypair2.publicKey.toString('hex')
 
   // Listen for connection on instance 1
   const onConnection = pEvent(remoteDiscovery1, 'authenticated')
@@ -225,8 +224,8 @@ test('RemoteDiscovery - Able to reconnect after disconnecting', async (t) => {
   await Promise.all([
     onEnd,
     // Need to disconnect both sides manually ATM cause disconenct isnt detected otherwise.
-    remoteDiscovery2.disconnectPeer(swarmPublicKey1Hex),
-    remoteDiscovery1.disconnectPeer(swarmPublicKey2Hex),
+    remoteDiscovery2.disconnectPeer(identityKeypair1.publicKey.toString('hex')),
+    remoteDiscovery1.disconnectPeer(identityKeypair2.publicKey.toString('hex')),
   ])
 
   // Listen for connection on instance 1

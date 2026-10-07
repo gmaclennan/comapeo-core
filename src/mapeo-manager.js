@@ -1304,23 +1304,18 @@ export class MapeoManager extends TypedEmitter {
   async #handleRedeemInviteOverInternet(peerId, redeem) {
     const { inviteId } = redeem
     const inviteIdString = inviteId.toString('hex')
-    const invite = await this.#inviteLinkStore.getById(inviteIdString)
-
-    if (!invite) {
-      // deny() waits for the peer to acknowledge before closing the connection
-      await this.#remoteDiscovery.deny(peerId, inviteId, 'unknown_invite_id')
-      throw new UnknownInviteIDRedeemAttemptError()
-    }
-
-    const { projectId } = invite
-
+    /** @type {string} */
+    let projectId
     try {
-      const project = await this.getProject(projectId)
-      await project.$member[kHandleRedeemInviteOverInternet](peerId, invite)
+      projectId = await this.#recordInviteLinkRequest(peerId, inviteIdString)
     } catch (e) {
       // The request was acknowledged, so the peer is waiting on us: tell it
-      // rather than leave it waiting until it gives up
-      await this.#remoteDiscovery.deny(peerId, inviteId, 'invitor_error')
+      // why it will not be admitted rather than leave it waiting
+      const reason =
+        e instanceof UnknownInviteIDRedeemAttemptError
+          ? 'unknown_invite_id'
+          : 'invitor_error'
+      await this.#remoteDiscovery.deny(peerId, inviteId, reason)
       throw e
     }
 
@@ -1336,6 +1331,21 @@ export class MapeoManager extends TypedEmitter {
       inviteIdString,
       requester
     )
+  }
+
+  /**
+   * Look up the invite link a peer asked to redeem and record the request with
+   * its project.
+   * @param {string} peerId
+   * @param {string} inviteIdString
+   * @returns {Promise<string>} the project ID the link is for
+   */
+  async #recordInviteLinkRequest(peerId, inviteIdString) {
+    const invite = await this.#inviteLinkStore.getById(inviteIdString)
+    if (!invite) throw new UnknownInviteIDRedeemAttemptError()
+    const project = await this.getProject(invite.projectId)
+    await project.$member[kHandleRedeemInviteOverInternet](peerId, invite)
+    return invite.projectId
   }
 
   async getMapStyleJsonUrl() {

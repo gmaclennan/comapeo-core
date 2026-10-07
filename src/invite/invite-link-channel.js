@@ -1,7 +1,6 @@
 import { TypedEmitter } from 'tiny-typed-emitter'
 import cenc from 'compact-encoding'
 import pDefer from 'p-defer'
-import timingSafeEqual from 'string-timing-safe-equal'
 import {
   Redeem,
   RedeemAck,
@@ -55,6 +54,9 @@ const MESSAGE_TYPES = /** @type {const} */ ({
  * an Admit or Deny *means* for the connection is decided by RemoteDiscovery,
  * which checks them against the request it actually sent.
  *
+ * Sends do not wait for the stream to drain: a connection carries a handful
+ * of small messages on this channel, and the ack timeout bounds delivery.
+ *
  * @extends {TypedEmitter<InviteLinkChannelEvents>}
  */
 export class InviteLinkChannel extends TypedEmitter {
@@ -62,10 +64,8 @@ export class InviteLinkChannel extends TypedEmitter {
   #opened = pDefer()
   #closed = false
   #acceptRedeem
-  /** @type {Map<'RedeemAck' | 'DenyAck', Set<{ inviteId: Buffer, deferred: DeferredPromise<void> }>>} */
-  #ackWaiters = new Map()
-  /** @type {Set<DeferredPromise<void>>} */
-  #drainWaiters = new Set()
+  /** @type {Map<string, DeferredPromise<void>>} keyed by ack type and invite id */
+  #pendingAcks = new Map()
   #l
 
   /**
@@ -112,10 +112,6 @@ export class InviteLinkChannel extends TypedEmitter {
       messages,
       onopen: () => this.#opened.resolve(),
       onclose: () => this.#handleClose(),
-      ondrain: () => {
-        for (const deferred of this.#drainWaiters) deferred.resolve()
-        this.#drainWaiters.clear()
-      },
     })
     if (!channel) {
       // Stream already destroyed, or a channel for this protocol already
@@ -196,22 +192,31 @@ export class InviteLinkChannel extends TypedEmitter {
       return
     }
     // Ack first: the ack means "received", not "decided"
-    this.#send(
+    this.#ackThenEmit(
       MESSAGE_TYPES.RedeemAck,
-      RedeemAck.encode({ inviteId: redeem.inviteId }).finish()
+      RedeemAck.encode({ inviteId: redeem.inviteId }).finish(),
+      () => this.emit('redeem', redeem)
     )
-      .then(() => this.emit('redeem', redeem))
-      .catch((e) => this.#l.log('failed to ack redeem: %s', e))
   }
 
   /** @param {Deny} deny */
   #handleDeny(deny) {
-    this.#send(
+    this.#ackThenEmit(
       MESSAGE_TYPES.DenyAck,
-      DenyAck.encode({ inviteId: deny.inviteId }).finish()
+      DenyAck.encode({ inviteId: deny.inviteId }).finish(),
+      () => this.emit('deny', deny)
     )
-      .then(() => this.emit('deny', deny))
-      .catch((e) => this.#l.log('failed to ack deny: %s', e))
+  }
+
+  /**
+   * @param {number} ackType
+   * @param {Uint8Array} encodedAck
+   * @param {() => void} emit
+   */
+  #ackThenEmit(ackType, encodedAck, emit) {
+    this.#send(ackType, encodedAck)
+      .then(emit)
+      .catch((e) => this.#l.log('failed to send ack: %s', e))
   }
 
   #handleClose() {
@@ -219,16 +224,10 @@ export class InviteLinkChannel extends TypedEmitter {
     this.#closed = true
     this.#opened.reject(new InviteRedeemConnectionClosedError())
     this.#opened.promise.catch(noop)
-    for (const waiters of this.#ackWaiters.values()) {
-      for (const { deferred } of waiters) {
-        deferred.reject(new InviteRedeemConnectionClosedError())
-      }
-    }
-    this.#ackWaiters.clear()
-    for (const deferred of this.#drainWaiters) {
+    for (const deferred of this.#pendingAcks.values()) {
       deferred.reject(new InviteRedeemConnectionClosedError())
     }
-    this.#drainWaiters.clear()
+    this.#pendingAcks.clear()
     this.emit('close')
   }
 
@@ -243,13 +242,7 @@ export class InviteLinkChannel extends TypedEmitter {
     await timeoutPromise(this.#opened.promise, {
       milliseconds: INVITE_LINK_ACK_TIMEOUT_MS,
     })
-    const didWrite = this.#channel.messages[messageType].send(
-      Buffer.from(encoded)
-    )
-    if (didWrite) return
-    const deferred = pDefer()
-    this.#drainWaiters.add(deferred)
-    await deferred.promise
+    this.#channel.messages[messageType].send(Buffer.from(encoded))
   }
 
   /**
@@ -258,12 +251,10 @@ export class InviteLinkChannel extends TypedEmitter {
    */
   async #waitForAck(type, inviteId) {
     if (this.#closed) throw new InviteRedeemConnectionClosedError()
+    const key = ackKey(type, inviteId)
     /** @type {DeferredPromise<void>} */
     const deferred = pDefer()
-    const waiter = { inviteId, deferred }
-    const waiters = this.#ackWaiters.get(type) || new Set()
-    waiters.add(waiter)
-    this.#ackWaiters.set(type, waiters)
+    this.#pendingAcks.set(key, deferred)
     try {
       await timeoutPromise(deferred.promise, {
         milliseconds: INVITE_LINK_ACK_TIMEOUT_MS,
@@ -274,7 +265,7 @@ export class InviteLinkChannel extends TypedEmitter {
       }
       throw e
     } finally {
-      waiters.delete(waiter)
+      this.#pendingAcks.delete(key)
     }
   }
 
@@ -283,12 +274,14 @@ export class InviteLinkChannel extends TypedEmitter {
    * @param {{ inviteId: Buffer }} ack
    */
   #receiveAck(type, ack) {
-    const waiters = this.#ackWaiters.get(type)
-    if (!waiters) return
-    for (const waiter of waiters) {
-      if (timingSafeEqual(waiter.inviteId, ack.inviteId)) {
-        waiter.deferred.resolve()
-      }
-    }
+    this.#pendingAcks.get(ackKey(type, ack.inviteId))?.resolve()
   }
+}
+
+/**
+ * @param {'RedeemAck' | 'DenyAck'} type
+ * @param {Buffer} inviteId
+ */
+function ackKey(type, inviteId) {
+  return `${type}:${inviteId.toString('hex')}`
 }

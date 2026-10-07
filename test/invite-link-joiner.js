@@ -248,9 +248,10 @@ test('invite received before admission resolves is not missed', async () => {
 
 test('denied by invitor fails with the deny reason', async () => {
   const swarmPublicKey = randomBytes(32)
+  const invitorIdentity = randomBytes(32)
   const inviteId = randomBytes(32)
   const url = testUrl(inviteId, swarmPublicKey)
-  const connection = mockConnection(randomBytes(32))
+  const connection = mockConnection(invitorIdentity)
   const mock = mockDiscovery(connection)
 
   const joiner = new InviteLinkJoiner({
@@ -268,7 +269,7 @@ test('denied by invitor fails with the deny reason', async () => {
 
   const failed = await onFailed
   assert.equal(failed.error?.name, InviteDeniedByInviterError.name)
-  assert.deepEqual(mock.disconnectCalls, [swarmPublicKey.toString('hex')])
+  assert.deepEqual(mock.disconnectCalls, [invitorIdentity.toString('hex')])
   assert.deepEqual(mock.leaveCalls, [swarmPublicKey.toString('hex')])
 })
 
@@ -302,9 +303,10 @@ test('connection closed before decision fails with a connection error', async ()
 
 test('cancelling while waiting for the invitor to decide', async () => {
   const swarmPublicKey = randomBytes(32)
+  const invitorIdentity = randomBytes(32)
   const inviteId = randomBytes(32)
   const url = testUrl(inviteId, swarmPublicKey)
-  const connection = mockConnection(randomBytes(32))
+  const connection = mockConnection(invitorIdentity)
   const mock = mockDiscovery(connection)
 
   const joiner = new InviteLinkJoiner({
@@ -325,7 +327,7 @@ test('cancelling while waiting for the invitor to decide', async () => {
 
   const failed = await onFailed
   assert.equal(failed.error?.name, JoinProjectCancelledError.name)
-  assert.deepEqual(mock.disconnectCalls, [swarmPublicKey.toString('hex')])
+  assert.deepEqual(mock.disconnectCalls, [invitorIdentity.toString('hex')])
 })
 
 test('admitted but the invite never arrives fails with a connection error', async () => {

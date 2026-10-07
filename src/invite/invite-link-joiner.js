@@ -19,6 +19,9 @@ import {
   ensureKnownError,
 } from '../errors.js'
 
+/** @import { RemoteDiscovery, RemoteAuthedNoiseStream } from '../discovery/remote-discovery.js' */
+/** @import { InviteApi } from '../invite/invite-api.js' */
+
 /**
  * How long to wait, once admitted, for the invitor's Invite to arrive over
  * RPC. The invitor sends it as soon as it admits us, so this only covers a
@@ -40,9 +43,6 @@ const NETWORK_ERROR_CODES = new Set([
   InitialSyncFailedError.code,
 ])
 
-/** @import { RemoteDiscovery } from '../discovery/remote-discovery.js' */
-/** @import { InviteApi } from '../invite/invite-api.js' */
-
 /**
  * - `connecting`: finding and connecting to the invitor, verifying its identity
  * - `connected`: identity verified, sending the redeem request
@@ -56,7 +56,7 @@ const NETWORK_ERROR_CODES = new Set([
 
 /**
  * A join request initiated via an invite URL. Listen to `join-request-update`
- * events for progress.
+ * events for progress; each update is a snapshot of the request.
  *
  * @typedef {object} JoinRequest
  * @property {string} inviteId Hex invite ID
@@ -67,13 +67,7 @@ const NETWORK_ERROR_CODES = new Set([
  * @property {string|undefined} projectId Resolved project ID on completion
  */
 
-/**
- * @typedef {object} JoinRequestUpdate
- * @property {JoinRequestStatus} status
- * @property {string} inviteId
- * @property {Error|null} [error]
- * @property {string|undefined} [projectId]
- */
+/** @typedef {JoinRequest} JoinRequestUpdate */
 
 /**
  * @typedef {Pick<RemoteDiscovery, 'connectPeer' | 'redeem' | 'waitForAdmission' | 'disconnectPeer' | 'leavePeer'>} JoinerDiscovery
@@ -95,12 +89,6 @@ const NETWORK_ERROR_CODES = new Set([
  */
 
 /**
- * @typedef {object} PendingJoinRequest
- * @property {AbortController} abortController
- * @property {JoinRequest} joinRequest
- */
-
-/**
  * Invitee side of invites over the internet: turns an invite URL into a
  * project membership by connecting to the invitor, redeeming the invite link
  * on the invite-link channel, and then accepting the regular invite that the
@@ -115,7 +103,7 @@ export class InviteLinkJoiner extends TypedEmitter {
   #defaultTimeout
   #inviteTimeout
   #l
-  /** @type {Map<string, PendingJoinRequest>} */
+  /** @type {Map<string, { abortController: AbortController, joinRequest: JoinRequest }>} */
   #pending = new Map()
 
   /**
@@ -165,10 +153,9 @@ export class InviteLinkJoiner extends TypedEmitter {
       projectId: undefined,
     }
     this.#pending.set(inviteId, { abortController, joinRequest })
-
     this.#emitUpdate(joinRequest)
 
-    // Start the async flow (fire-and-forget)
+    // Fire-and-forget: progress is reported through join-request-update
     this.#runJoinFlow(joinRequest, timeout, abortController.signal)
 
     return joinRequest
@@ -182,21 +169,20 @@ export class InviteLinkJoiner extends TypedEmitter {
   async #runJoinFlow(joinRequest, timeout, signal) {
     const { inviteId: inviteIdString, swarmPublicKey } = joinRequest
     const inviteId = Buffer.from(inviteIdString, 'hex')
+    /** @type {string | undefined} identity of the invitor, once connected */
+    let invitorDeviceId
 
     try {
       const connection = await this.#discovery.connectPeer(swarmPublicKey, {
         timeout,
         signal,
       })
-
-      // Connected: the invitor has proven its identity
+      // The identity key from the handshake, not the swarm key from the URL
+      invitorDeviceId = connection.authenticatedPublicKey.toString('hex')
       this.#setStatus(joinRequest, 'connected')
 
-      // Use the identity key from the handshake, not the swarm key from the URL
-      const invitorDeviceId = connection.authenticatedPublicKey.toString('hex')
-
-      // Start listening for the invite before we can be admitted, so a fast
-      // invitor cannot send it before we are listening
+      // Listen for the invite before we can be admitted, so a fast invitor
+      // cannot send it before we are listening
       const onInvited = pEvent(this.#inviteApi, 'invite-received', {
         filter: (invite) => invite.invitorDeviceId === invitorDeviceId,
         signal,
@@ -209,58 +195,36 @@ export class InviteLinkJoiner extends TypedEmitter {
         deviceName: name,
         deviceType: toRpcDeviceType(deviceType),
       })
-
-      // Requested: the invitor has our request and its user is deciding
       this.#setStatus(joinRequest, 'requested')
 
-      // Resolves when this invite is admitted, rejects on deny of this
-      // invite, disconnect or cancel
       await this.#discovery.waitForAdmission(connection, inviteId, { signal })
-
-      // Accepted: we are admitted, the regular invite follows over RPC
       this.#setStatus(joinRequest, 'accepted')
 
-      const onClose = pEvent(connection, 'close').then(
-        () => {
-          throw new InviteRedeemConnectionClosedError()
-        },
-        // Handle `error` event on connection if there's sudden closes
-        (e) => {
-          throw new InviteRedeemConnectionClosedError({ cause: e })
-        }
+      // Bounded: if we were already a member the invitor's RPC answers
+      // "already" and no invite ever arrives
+      const invite = await timeoutPromise(
+        Promise.race([onInvited, rejectOnClose(connection)]),
+        { milliseconds: this.#inviteTimeout }
       )
-      onClose.catch(noop)
+      joinRequest.projectId = await this.#inviteApi.accept(invite)
 
-      // An admitted peer that never receives the Invite (e.g. we were already
-      // a member and the invitor's RPC answered "already") must not wait
-      // forever
-      const invite = await timeoutPromise(Promise.race([onInvited, onClose]), {
-        milliseconds: this.#inviteTimeout,
-      })
-
-      const projectId = await this.#inviteApi.accept(invite)
-
-      // Completed. The connection is deliberately left open: our initial sync
-      // being done does not mean the invitor's is (it still wants our initial
-      // data and checks our role before it considers us joined), and we are
-      // now a member, so this is an ordinary sync connection. It closes when
-      // either side stops its swarm or the app closes.
-      joinRequest.projectId = projectId
+      // The connection is deliberately left open: our initial sync being done
+      // does not mean the invitor's is (it still wants our initial data and
+      // checks our role before it considers us joined), and we are now a
+      // member, so this is an ordinary sync connection. It closes when either
+      // side stops its swarm or the app closes.
       this.#setStatus(joinRequest, 'completed')
     } catch (e) {
       joinRequest.error = wrapNetworkError(e)
       this.#setStatus(joinRequest, 'failed')
       this.#l.log('join request %S failed: %s', inviteIdString, e)
-
-      try {
-        await this.#discovery.disconnectPeer(swarmPublicKey)
-      } catch {
-        // ignore disconnect errors
+      if (invitorDeviceId) {
+        await this.#discovery.disconnectPeer(invitorDeviceId).catch(noop)
       }
     } finally {
       // Hyperswarm keeps redialling a joined peer until we leave it. Stop the
-      // redials now (any open connection stays open); if it drops later the
-      // invitor remembers our admission for a while and project discovery
+      // redials now (an open connection stays open); if it drops later the
+      // invitor remembers our admission for a while, and project discovery
       // over the swarm, when it exists, is the way to reconnect.
       this.#discovery.leavePeer(swarmPublicKey)
       this.#pending.delete(inviteIdString)
@@ -276,18 +240,9 @@ export class InviteLinkJoiner extends TypedEmitter {
     this.#emitUpdate(joinRequest)
   }
 
-  /**
-   * @param {JoinRequest} joinRequest
-   */
+  /** @param {JoinRequest} joinRequest */
   #emitUpdate(joinRequest) {
-    /** @type {JoinRequestUpdate} */
-    const update = {
-      status: joinRequest.status,
-      inviteId: joinRequest.inviteId,
-      error: joinRequest.error,
-      projectId: joinRequest.projectId,
-    }
-    this.emit('join-request-update', update)
+    this.emit('join-request-update', { ...joinRequest })
   }
 
   /**
@@ -299,9 +254,7 @@ export class InviteLinkJoiner extends TypedEmitter {
    */
   getJoinRequestById(inviteId) {
     const pending = this.#pending.get(inviteId)
-    if (!pending) {
-      throw new JoinRequestNotFoundError({ inviteId })
-    }
+    if (!pending) throw new JoinRequestNotFoundError({ inviteId })
     return pending.joinRequest
   }
 
@@ -323,12 +276,30 @@ export class InviteLinkJoiner extends TypedEmitter {
    */
   cancelJoinRequest(inviteId, reason) {
     const pending = this.#pending.get(inviteId)
-    if (!pending) {
-      throw new JoinRequestNotFoundError({ inviteId })
-    }
+    if (!pending) throw new JoinRequestNotFoundError({ inviteId })
     pending.abortController.abort(reason ?? new JoinProjectCancelledError())
     this.#pending.delete(inviteId)
   }
+}
+
+/**
+ * A promise that never resolves, and rejects with
+ * InviteRedeemConnectionClosedError when the connection closes.
+ *
+ * @param {RemoteAuthedNoiseStream} connection
+ * @returns {Promise<never>}
+ */
+function rejectOnClose(connection) {
+  const closed = pEvent(connection, 'close').then(
+    () => {
+      throw new InviteRedeemConnectionClosedError()
+    },
+    (e) => {
+      throw new InviteRedeemConnectionClosedError({ cause: e })
+    }
+  )
+  closed.catch(noop)
+  return closed
 }
 
 /** @type {Set<string>} */

@@ -64,6 +64,14 @@ export const kHandleRedeemInviteOverInternet = Symbol(
 )
 
 /**
+ * @param {string} inviteId
+ * @param {string} deviceId
+ */
+function pendingRequestKey(inviteId, deviceId) {
+  return `${inviteId}:${deviceId}`
+}
+
+/**
  * Errors from the RPC layer that mean the peer went away
  * @type {Set<string>}
  */
@@ -88,7 +96,6 @@ const PEER_GONE_ERROR_CODES = new Set([
 /** @import { deviceInfoTable } from './schema/project.js' */
 /** @import { projectSettingsTable } from './schema/client.js' */
 /** @import { ReplicationStream, MapeoValueMap } from './types.js' */
-/** @import { PeerInfoDisconnected } from './local-peers.js' */
 /** @import { InviteLinkRecord } from './invite/invite-links-api.js' */
 /** @import { InviteLinksApiForProject } from './invite/invite-links-api.js' */
 
@@ -183,9 +190,12 @@ export class MemberApi extends TypedEmitter {
   /** @type {Map<string, { abortController: AbortController }>} */
   #outboundInvitesByDevice = new Map()
 
-  /** Track which device IDs have redeemed each invite (by inviteId) */
-  /** @type {Map<string, Set<string>>} */
-  #redeemedInvites = new Map()
+  /**
+   * Devices that have asked to redeem an invite link and are waiting for a
+   * decision, as `inviteId:deviceId`
+   * @type {Set<string>}
+   */
+  #pendingRequests = new Set()
 
   /**
    * @param {Object} opts
@@ -239,12 +249,10 @@ export class MemberApi extends TypedEmitter {
     this.#setDeviceInfo = setDeviceInfo
     this.#getSwarmPublicKey = getSwarmPublicKey
 
-    this.#rpc.on('peer-remove', this.#handlePeerRemove)
     this.#remoteDiscovery.on('peer-closed', this.#handleRemotePeerClosed)
   }
 
   async close() {
-    this.#rpc.removeListener('peer-remove', this.#handlePeerRemove)
     this.#remoteDiscovery.off('peer-closed', this.#handleRemotePeerClosed)
   }
 
@@ -309,7 +317,7 @@ export class MemberApi extends TypedEmitter {
     if (!(await this.#inviteLinks.getById(inviteIdString))) {
       throw new InvalidInternetInviteURLError()
     }
-    this.#redeemedInvites.delete(inviteIdString)
+    this.#forgetPendingRequests((key) => key.startsWith(`${inviteIdString}:`))
     await this.#inviteLinks.delete(inviteIdString)
   }
 
@@ -329,59 +337,56 @@ export class MemberApi extends TypedEmitter {
   }
 
   /**
-   * When a peer disconnects, remove them from the redeemed invites set.
-   * @param {PeerInfoDisconnected} peer
-   */
-  #handlePeerRemove = (peer) => {
-    if (!peer) return
-    this.#clearRedeemedByDevice(peer.deviceId)
-  }
-
-  /**
-   * A remote peer that redeemed an invite link but was not yet admitted is
-   * never seen by the RPC layer, so its disconnect arrives from discovery.
+   * A device that goes away takes its pending requests with it. Un-admitted
+   * peers are never seen by the RPC layer, so this comes from discovery.
    * @param {string} deviceId
    */
   #handleRemotePeerClosed = (deviceId) => {
-    this.#clearRedeemedByDevice(deviceId)
+    this.#forgetPendingRequests((key) => key.endsWith(`:${deviceId}`))
   }
 
-  /** @param {string} deviceId */
-  #clearRedeemedByDevice(deviceId) {
-    for (const deviceIds of this.#redeemedInvites.values()) {
-      deviceIds.delete(deviceId)
+  /** @param {(key: string) => boolean} where */
+  #forgetPendingRequests(where) {
+    for (const key of this.#pendingRequests) {
+      if (where(key)) this.#pendingRequests.delete(key)
     }
   }
 
   /**
-   * Handle an incoming redeem attempt from the RPC layer.
+   * Handle an incoming redeem attempt from discovery.
    * @param {string} peerId
    * @param {InviteLinkRecord} invite
    */
   async [kHandleRedeemInviteOverInternet](peerId, invite) {
     const inviteIdString = invite.inviteId
-    this.#l.log('Got incoming invite redeem %S from %S', inviteIdString, peerId)
-
-    const redeemedSet = this.#redeemedInvites.get(inviteIdString)
-    if (redeemedSet?.has(peerId)) {
-      // A repeated redeem (a retry after a dropped connection, or a second
-      // tap on the link) is the same request, not a new one: the channel has
-      // acknowledged it again and the app is told again so it can refresh
-      // whatever it shows for this pending request
-      this.#l.log(
-        'Repeated redeem of %S from %S',
-        inviteIdString.slice(0, 7),
-        peerId
-      )
-      return inviteIdString
-    }
-
-    if (!redeemedSet) {
-      this.#redeemedInvites.set(inviteIdString, new Set([peerId]))
-    } else {
-      redeemedSet.add(peerId)
-    }
+    const key = pendingRequestKey(inviteIdString, peerId)
+    // A repeated redeem (a retry after a dropped connection, or a second tap
+    // on the link) is the same request: the app is told again so it can
+    // refresh whatever it shows for it
+    const repeated = this.#pendingRequests.has(key)
+    this.#l.log(
+      '%s invite redeem %S from %S',
+      repeated ? 'Repeated' : 'Got',
+      inviteIdString.slice(0, 7),
+      peerId
+    )
+    this.#pendingRequests.add(key)
     return inviteIdString
+  }
+
+  /**
+   * The invite link a device has asked to redeem. Throws if the device has
+   * not asked, or if the link no longer exists.
+   * @param {string} inviteId
+   * @param {string} deviceId
+   */
+  async #getPendingInviteLink(inviteId, deviceId) {
+    if (!this.#pendingRequests.has(pendingRequestKey(inviteId, deviceId))) {
+      throw new InviteNotYetRedeemedError()
+    }
+    const inviteLink = await this.#inviteLinks.getById(inviteId)
+    if (!inviteLink) throw new UnknownInviteIDError()
+    return inviteLink
   }
 
   /**
@@ -391,15 +396,9 @@ export class MemberApi extends TypedEmitter {
    * @returns {Promise<InviteDecision>}
    */
   async acceptInviteLinkRequest(inviteId, deviceId) {
-    const redeemedSet = this.#redeemedInvites.get(inviteId)
-    if (!redeemedSet || !redeemedSet.has(deviceId)) {
-      throw new InviteNotYetRedeemedError()
-    }
-
-    const pendingInvite = await this.#inviteLinks.getById(inviteId)
-    if (!pendingInvite) {
-      throw new UnknownInviteIDError()
-    }
+    const { roleId, roleName, roleDescription } =
+      await this.#getPendingInviteLink(inviteId, deviceId)
+    const key = pendingRequestKey(inviteId, deviceId)
 
     // Admitting opens the RPC channel with the peer, over which the regular
     // invite flow then runs
@@ -407,12 +406,10 @@ export class MemberApi extends TypedEmitter {
       deviceId,
       Buffer.from(inviteId, 'hex')
     )
-
     if (!stillConnected) {
-      redeemedSet.delete(deviceId)
+      this.#pendingRequests.delete(key)
       throw new PeerDisconnectedSinceRedeemingInviteError()
     }
-    const { roleId, roleName, roleDescription } = pendingInvite
     try {
       const decision = await this.invite(deviceId, {
         roleId,
@@ -420,8 +417,8 @@ export class MemberApi extends TypedEmitter {
         roleDescription,
         leaveOnFail: true,
       })
-      // The request is answered; a later redeem from this device is a new one
-      redeemedSet.delete(deviceId)
+      // Answered: a later redeem from this device is a new request
+      this.#pendingRequests.delete(key)
       return decision
     } catch (e) {
       await this.#remoteDiscovery.disconnectPeer(deviceId)
@@ -448,16 +445,7 @@ export class MemberApi extends TypedEmitter {
     deviceId,
     reason = Deny_DenyReason.invitor_denied
   ) {
-    const redeemedSet = this.#redeemedInvites.get(inviteId)
-    if (!redeemedSet || !redeemedSet.has(deviceId)) {
-      throw new InviteNotYetRedeemedError()
-    }
-
-    const pendingInvite = await this.#inviteLinks.getById(inviteId)
-    if (!pendingInvite) {
-      throw new UnknownInviteIDError()
-    }
-
+    await this.#getPendingInviteLink(inviteId, deviceId)
     // Sends the deny, waits for the peer to acknowledge it, and disconnects
     // (unless the peer is already a member, who keeps its connection)
     await this.#remoteDiscovery.deny(
@@ -465,7 +453,7 @@ export class MemberApi extends TypedEmitter {
       Buffer.from(inviteId, 'hex'),
       reason
     )
-    redeemedSet.delete(deviceId)
+    this.#pendingRequests.delete(pendingRequestKey(inviteId, deviceId))
   }
 
   /**
