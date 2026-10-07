@@ -38,7 +38,7 @@ const MESSAGE_TYPES = /** @type {const} */ ({
 /**
  * @typedef {object} InviteLinkChannelEvents
  * @property {(redeem: Redeem) => void} redeem Peer is asking to redeem an invite link (ack has already been sent)
- * @property {(admit: Admit) => void} admit Peer has admitted us
+ * @property {(admit: Admit) => void} admit Peer says we are admitted
  * @property {(deny: Deny) => void} deny Peer has denied us (ack has already been sent)
  * @property {() => void} close Channel closed (peer closed it, rejected it, or the stream ended)
  */
@@ -50,8 +50,10 @@ const MESSAGE_TYPES = /** @type {const} */ ({
  * takes to decide, so Redeem and Deny are acknowledged separately to tell
  * "received, waiting for a decision" apart from "never arrived".
  *
- * One instance per connection. Both sides create it right after the identity
- * handshake; protomux pairs the two.
+ * One instance per connection. Both sides create it right after the NOISE
+ * stream opens; protomux pairs the two. The channel only moves messages: what
+ * an Admit or Deny *means* for the connection is decided by RemoteDiscovery,
+ * which checks them against the request it actually sent.
  *
  * @extends {TypedEmitter<InviteLinkChannelEvents>}
  */
@@ -59,6 +61,7 @@ export class InviteLinkChannel extends TypedEmitter {
   #channel
   #opened = pDefer()
   #closed = false
+  #acceptRedeem
   /** @type {Map<'RedeemAck' | 'DenyAck', Set<{ inviteId: Buffer, deferred: DeferredPromise<void> }>>} */
   #ackWaiters = new Map()
   /** @type {Set<DeferredPromise<void>>} */
@@ -69,10 +72,12 @@ export class InviteLinkChannel extends TypedEmitter {
    * @param {Protomux<any>} protomux
    * @param {object} [opts]
    * @param {Logger} [opts.logger]
+   * @param {(redeem: Redeem) => boolean} [opts.acceptRedeem] Called before acknowledging a Redeem; return false to drop it unacknowledged (e.g. the peer has not proven its identity yet)
    */
-  constructor(protomux, { logger } = {}) {
+  constructor(protomux, { logger, acceptRedeem = () => true } = {}) {
     super()
     this.#l = Logger.create('inviteLink', logger)
+    this.#acceptRedeem = acceptRedeem
 
     /** @type {Parameters<typeof Protomux.prototype.createChannel>[0]['messages']} */
     const messages = []
@@ -143,16 +148,22 @@ export class InviteLinkChannel extends TypedEmitter {
   }
 
   /**
-   * Tell the peer it is admitted. There is no ack for this: the next thing
-   * that happens is the regular invite over the RPC channel, which has its
-   * own acknowledgement.
+   * Tell the peer it is admitted. Synchronous: the bytes are handed to the
+   * stream before this returns, so the caller can set up what the peer's next
+   * message depends on (its RPC open) in the same tick. There is no ack: the
+   * next thing that happens is the regular invite over the RPC channel, which
+   * has its own acknowledgement.
    *
    * @param {Admit} admit
-   * @returns {Promise<void>}
+   * @returns {boolean} false if the channel is closed
    */
-  async sendAdmit(admit) {
-    await this.#send(MESSAGE_TYPES.Admit, Admit.encode(admit).finish())
+  trySendAdmit(admit) {
+    if (this.#closed || !this.#channel) return false
+    this.#channel.messages[MESSAGE_TYPES.Admit].send(
+      Buffer.from(Admit.encode(admit).finish())
+    )
     this.#l.log('sent admit for %h', admit.inviteId)
+    return true
   }
 
   /**
@@ -180,6 +191,10 @@ export class InviteLinkChannel extends TypedEmitter {
 
   /** @param {Redeem} redeem */
   #handleRedeem(redeem) {
+    if (!this.#acceptRedeem(redeem)) {
+      this.#l.log('dropping redeem %h: not accepted', redeem.inviteId)
+      return
+    }
     // Ack first: the ack means "received", not "decided"
     this.#send(
       MESSAGE_TYPES.RedeemAck,

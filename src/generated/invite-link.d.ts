@@ -28,6 +28,8 @@ export declare const Deny_DenyReason: {
     readonly unspecified: "unspecified";
     readonly unknown_invite_id: "unknown_invite_id";
     readonly invitor_denied: "invitor_denied";
+    /** invitor_error - The invitor failed to handle the request after acknowledging it */
+    readonly invitor_error: "invitor_error";
     readonly UNRECOGNIZED: "UNRECOGNIZED";
 };
 export type Deny_DenyReason = typeof Deny_DenyReason[keyof typeof Deny_DenyReason];

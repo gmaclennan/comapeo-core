@@ -420,6 +420,8 @@ export class MemberApi extends TypedEmitter {
         roleDescription,
         leaveOnFail: true,
       })
+      // The request is answered; a later redeem from this device is a new one
+      redeemedSet.delete(deviceId)
       return decision
     } catch (e) {
       await this.#remoteDiscovery.disconnectPeer(deviceId)
@@ -457,11 +459,13 @@ export class MemberApi extends TypedEmitter {
     }
 
     // Sends the deny, waits for the peer to acknowledge it, and disconnects
+    // (unless the peer is already a member, who keeps its connection)
     await this.#remoteDiscovery.deny(
       deviceId,
       Buffer.from(inviteId, 'hex'),
       reason
     )
+    redeemedSet.delete(deviceId)
   }
 
   /**

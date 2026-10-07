@@ -67,7 +67,7 @@ test('admit is delivered', async () => {
   const onAdmit = /** @type {Promise<Admit>} */ (
     /** @type {unknown} */ (pEvent(invitee, 'admit', { timeout: 1000 }))
   )
-  await invitor.sendAdmit({ inviteId })
+  assert.equal(invitor.trySendAdmit({ inviteId }), true)
   const admit = await onAdmit
   assert.ok(admit.inviteId.equals(inviteId))
 })

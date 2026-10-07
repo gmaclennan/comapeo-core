@@ -19,8 +19,10 @@ import {
   ensureKnownError,
   InvalidIdentityProofError,
   InviteDeniedByInviterError,
-  InviteRedeemConnectionClosedError,
+  InviteLinkNotRequestedError,
+  InviteLinkRequestPendingError,
 } from '../../src/errors.js'
+import { InviteLinkChannel } from '../../src/invite/invite-link-channel.js'
 import { randomBytes } from 'node:crypto'
 import pDefer from 'p-defer'
 
@@ -682,45 +684,124 @@ test('RemoteDiscovery - deny rejects the wait with the reason and closes', async
   await onClose
 })
 
-test('RemoteDiscovery - a deny for one invite does not decide another on the same connection', async (t) => {
+test('RemoteDiscovery - an admitted member can ask for another link and be denied without losing its connection', async (t) => {
   const { invitor, invitee, outbound, inviteeDeviceId } = await connectedPair(t)
   const inviteA = randomBytes(32)
   const inviteB = randomBytes(32)
-
-  /** @type {Buffer[]} */
-  const redeemed = []
-  invitor.on('redeem', (_deviceId, redeem) => redeemed.push(redeem.inviteId))
-
-  await invitee.redeem(outbound, {
-    inviteId: inviteA,
+  const redeem = (/** @type {Buffer} */ inviteId) => ({
+    inviteId,
     deviceName: '',
-    deviceType: 'device_type_unspecified',
+    deviceType: /** @type {const} */ ('device_type_unspecified'),
   })
-  await invitee.redeem(outbound, {
-    inviteId: inviteB,
-    deviceName: '',
-    deviceType: 'device_type_unspecified',
-  })
+
+  // Join via A
+  const onRedeemA = pEvent(invitor, 'redeem', { timeout: 5000 })
+  await invitee.redeem(outbound, redeem(inviteA))
   const waitA = invitee.waitForAdmission(outbound, inviteA)
-  const waitB = invitee.waitForAdmission(outbound, inviteB)
-  waitA.catch(noop)
-  waitB.catch(noop)
-  assert.equal(redeemed.length, 2, 'invitor saw both redeems')
+  await onRedeemA
+  assert.equal(await invitor.admit(inviteeDeviceId, inviteA), true)
+  await waitA
 
-  // Deny A without closing: send the deny on the channel directly by denying
-  // and then checking B is still pending before the socket closes
-  let bSettled = false
-  waitB.then(
-    () => (bSettled = true),
-    () => (bSettled = true)
+  // Now a member, ask for B on the same connection and get denied
+  const onRedeemB = pEvent(invitor, 'redeem', { timeout: 5000 })
+  await invitee.redeem(outbound, redeem(inviteB))
+  const waitB = invitee.waitForAdmission(outbound, inviteB)
+  waitB.catch(noop)
+  await onRedeemB
+  await invitor.deny(inviteeDeviceId, inviteB, 'invitor_denied')
+  await assert.rejects(waitB, { code: InviteDeniedByInviterError.code })
+
+  // The sync connection survives the deny and is still usable
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(outbound.destroyed, false, 'member keeps its connection')
+  const onRedeemC = pEvent(invitor, 'redeem', { timeout: 5000 })
+  const inviteC = randomBytes(32)
+  await invitee.redeem(outbound, redeem(inviteC))
+  const waitC = invitee.waitForAdmission(outbound, inviteC)
+  await onRedeemC
+  assert.equal(await invitor.admit(inviteeDeviceId, inviteC), true)
+  await waitC
+})
+
+test('RemoteDiscovery - a different link cannot be redeemed while one is being decided', async (t) => {
+  const { invitee, outbound } = await connectedPair(t)
+  const redeem = (/** @type {Buffer} */ inviteId) => ({
+    inviteId,
+    deviceName: '',
+    deviceType: /** @type {const} */ ('device_type_unspecified'),
+  })
+  await invitee.redeem(outbound, redeem(randomBytes(32)))
+  await assert.rejects(invitee.redeem(outbound, redeem(randomBytes(32))), {
+    code: InviteLinkRequestPendingError.code,
+  })
+  // ...and a wait for something we never asked for is refused
+  await assert.rejects(invitee.waitForAdmission(outbound, randomBytes(32)), {
+    code: InviteLinkNotRequestedError.code,
+  })
+})
+
+test('RemoteDiscovery - an Admit we never asked for does not admit and closes the connection', async (t) => {
+  const identityKeypair = new KeyManager(
+    Buffer.alloc(16, 1)
+  ).getIdentityKeypair()
+  const peerIdentityKeypair = new KeyManager(
+    Buffer.alloc(16, 2)
+  ).getIdentityKeypair()
+  const swarmKeypair = new KeyManager(Buffer.alloc(16, 3)).getIdentityKeypair()
+  const handshakeHash = Buffer.alloc(32, 0)
+
+  const discovery = new RemoteDiscovery({
+    identityKeypair,
+    deriveSwarmIdentityKeypair: () => swarmKeypair,
+  })
+  t.after(() => discovery.close())
+  discovery.on('error', noop)
+
+  const [serverStream, peerStream] = createStreamPair()
+  const serverSocket = makeServerStream(
+    serverStream,
+    swarmKeypair,
+    handshakeHash
   )
-  // deny() closes the connection after the ack, which would also reject B,
-  // so observe A's rejection first via the deny message itself
-  const denyPromise = invitor.deny(inviteeDeviceId, inviteA, 'invitor_denied')
-  await assert.rejects(waitA, { code: InviteDeniedByInviterError.code })
-  assert.equal(bSettled, false, 'B is not decided by a deny of A')
-  await denyPromise
-  await assert.rejects(waitB, { code: InviteRedeemConnectionClosedError.code })
+  // Attach the peer's protomux up front so the auth helper and our channel
+  // share it
+  const peerProtomux = Protomux.from(peerStream)
+  // @ts-ignore mocking
+  peerStream.userData = peerProtomux
+  // A conforming peer creates its invite-link channel up front, before the
+  // handshake, so that the server's open pairs with it
+  const hostile = new InviteLinkChannel(peerProtomux)
+
+  let connections = 0
+  discovery.on('connection', () => connections++)
+  const onAuthenticated = pEvent(discovery, 'authenticated', { timeout: 5000 })
+  const serverPromise =
+    discovery[kTestOnlyHandleHyperswarmConnection](serverSocket)
+
+  const peerChannel = await setupPeerAuth(peerStream)
+  peerChannel.messages[0].send(
+    Buffer.from(Hello.encode({ protocolVersion: 1 }).finish())
+  )
+  const sig = new Uint8Array(64)
+  sodium.crypto_sign_detached(sig, handshakeHash, peerIdentityKeypair.secretKey)
+  peerChannel.messages[1].send(
+    Buffer.from(
+      IdentityProof.encode({
+        publicKey: peerIdentityKeypair.publicKey,
+        signature: Buffer.from(sig),
+      }).finish()
+    )
+  )
+  await onAuthenticated
+  await serverPromise
+
+  // The peer is authenticated but has not redeemed anything. It now claims
+  // to admit us.
+  const onFinish = pEvent(serverStream, 'finish', { timeout: 5000 })
+  assert.equal(hostile.trySendAdmit({ inviteId: Buffer.alloc(32, 7) }), true)
+
+  await onFinish
+  assert.equal(connections, 0, 'no connection was emitted')
 })
 
 test('RemoteDiscovery - repeated redeem is acknowledged and emitted again', async (t) => {

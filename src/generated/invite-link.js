@@ -5,6 +5,8 @@ export var Deny_DenyReason = {
     unspecified: "unspecified",
     unknown_invite_id: "unknown_invite_id",
     invitor_denied: "invitor_denied",
+    /** invitor_error - The invitor failed to handle the request after acknowledging it */
+    invitor_error: "invitor_error",
     UNRECOGNIZED: "UNRECOGNIZED",
 };
 export function deny_DenyReasonFromJSON(object) {
@@ -18,6 +20,9 @@ export function deny_DenyReasonFromJSON(object) {
         case 2:
         case "invitor_denied":
             return Deny_DenyReason.invitor_denied;
+        case 3:
+        case "invitor_error":
+            return Deny_DenyReason.invitor_error;
         case -1:
         case "UNRECOGNIZED":
         default:
@@ -32,6 +37,8 @@ export function deny_DenyReasonToNumber(object) {
             return 1;
         case Deny_DenyReason.invitor_denied:
             return 2;
+        case Deny_DenyReason.invitor_error:
+            return 3;
         case Deny_DenyReason.UNRECOGNIZED:
         default:
             return -1;

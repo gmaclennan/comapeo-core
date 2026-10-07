@@ -327,3 +327,31 @@ test('cancelling while waiting for the invitor to decide', async () => {
   assert.equal(failed.error?.name, JoinProjectCancelledError.name)
   assert.deepEqual(mock.disconnectCalls, [swarmPublicKey.toString('hex')])
 })
+
+test('admitted but the invite never arrives fails with a connection error', async () => {
+  const swarmPublicKey = randomBytes(32)
+  const inviteId = randomBytes(32)
+  const url = testUrl(inviteId, swarmPublicKey)
+  const connection = mockConnection(randomBytes(32))
+  const mock = mockDiscovery(connection)
+
+  const joiner = new InviteLinkJoiner({
+    discovery: mock.discovery,
+    inviteApi: /** @type {InviteApi} */ (
+      /** @type {unknown} */ (new MockInviteApi())
+    ),
+    getDeviceInfo: () => ({}),
+    inviteTimeout: 50,
+  })
+
+  const onAccepted = onStatus(joiner, 'accepted')
+  const onFailed = onStatus(joiner, 'failed')
+  joiner.createJoinRequest(url)
+  mock.ackRedeem()
+  mock.admit()
+  await onAccepted
+
+  const failed = await onFailed
+  assert.equal(failed.error?.name, InviteConnectionError.name)
+  assert.equal(/** @type {any} */ (failed.error).cause?.code, 'TIMEOUT_ERROR')
+})

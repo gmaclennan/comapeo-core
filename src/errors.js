@@ -579,6 +579,19 @@ export const PeerDisconnectedSinceRedeemingInviteError = createErrorClass({
   status: 408,
 })
 
+export const InviteLinkRequestPendingError = createErrorClass({
+  code: 'INVITE_LINK_REQUEST_PENDING_ERROR',
+  message:
+    'Another invite link is still waiting for a decision on this connection',
+  status: 409,
+})
+
+export const InviteLinkNotRequestedError = createErrorClass({
+  code: 'INVITE_LINK_NOT_REQUESTED_ERROR',
+  message: 'No redeem request was sent for this invite on this connection',
+  status: 400,
+})
+
 export const UnknownInviteIDError = createErrorClass({
   code: 'UNKNOWN_INVITE_ID_ERROR',
   message: 'Unknown invite ID',

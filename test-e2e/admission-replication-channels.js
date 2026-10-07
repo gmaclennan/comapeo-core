@@ -10,6 +10,8 @@ import { pEvent } from 'p-event'
 import { getDeviceId } from '../src/utils.js'
 import { InviteResponse_Decision } from '../src/generated/rpc.js'
 import { parseInviteURL } from '../src/invite/invite-urls.js'
+import { Admit } from '../src/generated/invite-link.js'
+import { INVITE_LINK_PROTOCOL } from '../src/invite/invite-link-channel.js'
 
 /**
  * Create a minimal "fake peer" that can connect to a MapeoManager over
@@ -263,4 +265,55 @@ test('discovery key received matches project creator core', async (t) => {
     'INITIAL_SYNC_FAILED_ERROR',
     'expected InitialSyncFailedError'
   )
+})
+
+test('a peer that never redeemed cannot admit itself', async (t) => {
+  const testnet = await createTestnet(2)
+  t.after(() => testnet.destroy())
+
+  const manager = createManager('invitor', t, {
+    swarm: { dht: testnet.nodes[0] },
+  })
+  await manager.setDeviceInfo({ name: 'invitor', deviceType: 'desktop' })
+  const projectId = await manager.createProject({ name: 'Secret Project' })
+  const project = await manager.getProject(projectId)
+  const url = await project.$member.createInviteLink({ roleId: MEMBER_ROLE_ID })
+  const { swarmPublicKey } = parseInviteURL(url)
+
+  // The attacker knows only the swarm public key, which is in every invite URL
+  const keyManager = new KeyManager(KeyManager.generateRootKey())
+  const attackerId = getDeviceId(keyManager)
+  const attacker = new RemoteDiscovery({
+    identityKeypair: keyManager.getIdentityKeypair(),
+    deriveSwarmIdentityKeypair: () =>
+      keyManager.deriveSwarmIdentity(new Date()),
+    swarm: { dht: testnet.nodes[0] },
+  })
+  attacker.on('error', () => {})
+  t.after(() => attacker.close())
+
+  let joinRequests = 0
+  manager.on('invite-link-join-request', () => joinRequests++)
+
+  const conn = await attacker.connectPeer(swarmPublicKey, { timeout: 10_000 })
+  const onClose = pEvent(conn, 'close', { timeout: 10_000 })
+
+  // Send Admit for a random invite ID without ever having redeemed anything
+  // getLastChannel is missing from the protomux types
+  const protomux = /** @type {any} */ (conn.userData)
+  const channel = protomux.getLastChannel({ protocol: INVITE_LINK_PROTOCOL })
+  assert.ok(channel, 'attacker has the invite-link channel')
+  channel.messages[2].send(
+    Buffer.from(Admit.encode({ inviteId: Buffer.alloc(32, 7) }).finish())
+  )
+
+  // The invitor drops the connection and never treated the attacker as a peer
+  await onClose
+  const peers = await manager.listLocalPeers()
+  assert.equal(
+    peers.some((p) => p.deviceId === attackerId),
+    false,
+    'attacker never became a peer'
+  )
+  assert.equal(joinRequests, 0, 'invitor app was never asked')
 })

@@ -40,6 +40,8 @@ message Deny {
     unspecified = 0;
     unknown_invite_id = 1;
     invitor_denied = 2;
+    // The invitor failed to handle the request after acknowledging it
+    invitor_error = 3;
   }
   bytes inviteId = 1;
   DenyReason reason = 2;

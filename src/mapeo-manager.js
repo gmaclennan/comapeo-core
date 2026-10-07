@@ -74,6 +74,17 @@ import { kHandleRedeemInviteOverInternet } from './member-api.js'
 
 /** @import { MapShareExtension } from './generated/rpc.js' */
 /** @import { Redeem } from './generated/invite-link.js' */
+
+/**
+ * What a device asking to redeem an invite link says about itself. Not
+ * verified: show it to the user alongside the device ID, do not act on it.
+ * @typedef {object} InviteLinkRequester
+ * @property {string} name
+ * @property {import('./generated/rpc.js').DeviceInfo['deviceType']} deviceType
+ */
+
+/** Longest requester name we pass on from a Redeem message */
+const MAX_REQUESTER_NAME_LENGTH = 100
 /** @import NoiseSecretStream from '@hyperswarm/secret-stream' */
 /** @import { SetNonNullable } from 'type-fest' */
 /** @import { ProjectJoinDetails, } from './generated/rpc.js' */
@@ -151,7 +162,7 @@ export const kForceAddProjectFail = Symbol('kForceAddProjectFail')
  * @property {(peers: PublicPeerInfo[]) => void} local-peers Emitted when the list of connected peers changes (new ones added, or connection status changes)
  * @property {(mapShare: MapShare) => void} map-share Emitted when a project has recieved a map share request
  * @property {(e: Error, mapShare: MapShareExtension) => void} map-share-error - Emitted when an incoming map share fails to be recieved due to formatting issues
- * @property {(projectId: string, deviceId: string, inviteId: string) => void} invite-link-join-request Emitted when an invite over the internet link has been redeemed, accept the deviceId to add them. May be emitted again for the same device and invite if the device repeats its request (e.g. after a dropped connection); treat it as a refresh of the same pending request.
+ * @property {(projectId: string, deviceId: string, inviteId: string, requester: InviteLinkRequester) => void} invite-link-join-request Emitted when an invite over the internet link has been redeemed, accept the deviceId to add them. `requester` carries the name and device type the requesting device gave for itself (unverified, for display only). May be emitted again for the same device and invite if the device repeats its request (e.g. after a dropped connection); treat it as a refresh of the same pending request.
  * @property {(err: Error, deviceId: string, inviteId: string) => void} invite-link-join-request-error Emitted when an invite over the internet has failed to be redeemed
  */
 
@@ -1290,7 +1301,8 @@ export class MapeoManager extends TypedEmitter {
    * @param {string} peerId
    * @param {Redeem} redeem
    */
-  async #handleRedeemInviteOverInternet(peerId, { inviteId }) {
+  async #handleRedeemInviteOverInternet(peerId, redeem) {
+    const { inviteId } = redeem
     const inviteIdString = inviteId.toString('hex')
     const invite = await this.#inviteLinkStore.getById(inviteIdString)
 
@@ -1302,11 +1314,28 @@ export class MapeoManager extends TypedEmitter {
 
     const { projectId } = invite
 
-    const project = await this.getProject(projectId)
+    try {
+      const project = await this.getProject(projectId)
+      await project.$member[kHandleRedeemInviteOverInternet](peerId, invite)
+    } catch (e) {
+      // The request was acknowledged, so the peer is waiting on us: tell it
+      // rather than leave it waiting until it gives up
+      await this.#remoteDiscovery.deny(peerId, inviteId, 'invitor_error')
+      throw e
+    }
 
-    await project.$member[kHandleRedeemInviteOverInternet](peerId, invite)
-
-    this.emit('invite-link-join-request', projectId, peerId, inviteIdString)
+    /** @type {InviteLinkRequester} */
+    const requester = {
+      name: redeem.deviceName.slice(0, MAX_REQUESTER_NAME_LENGTH),
+      deviceType: redeem.deviceType,
+    }
+    this.emit(
+      'invite-link-join-request',
+      projectId,
+      peerId,
+      inviteIdString,
+      requester
+    )
   }
 
   async getMapStyleJsonUrl() {

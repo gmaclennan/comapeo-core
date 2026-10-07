@@ -47,7 +47,9 @@ network.
 // May fire again for the same deviceId and inviteId if the invitee repeats
 // its request (e.g. after a dropped connection): treat that as a refresh of
 // the same pending request, not a new one
-manager.on('invite-link-join-request', async (projectId, deviceId, inviteId,) => {
+manager.on('invite-link-join-request', async (projectId, deviceId, inviteId, requester) => {
+  // requester.name and requester.deviceType are what the requesting device
+  // said about itself: show them next to the deviceId, do not rely on them
   const project = await manager.getProject(projectId)
 
   // Reason is same as from invite api

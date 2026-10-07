@@ -3,7 +3,7 @@ import { pEvent } from 'p-event'
 import { parseInviteURL } from './invite-urls.js'
 import { DeviceInfo_DeviceType } from '../generated/rpc.js'
 import { Logger } from '../logger.js'
-import { noop } from '../utils.js'
+import { noop, timeoutPromise } from '../utils.js'
 import {
   ExistingJoinRequestError,
   InviteRedeemConnectionClosedError,
@@ -18,6 +18,13 @@ import {
   InitialSyncFailedError,
   ensureKnownError,
 } from '../errors.js'
+
+/**
+ * How long to wait, once admitted, for the invitor's Invite to arrive over
+ * RPC. The invitor sends it as soon as it admits us, so this only covers a
+ * slow or stalled invitor; it is not a human-decision wait.
+ */
+export const INVITE_AFTER_ADMISSION_TIMEOUT_MS = 30_000
 
 /**
  * Error codes that indicate a network/transport failure
@@ -78,6 +85,7 @@ const NETWORK_ERROR_CODES = new Set([
  * @property {Pick<InviteApi, 'on' | 'accept'>} inviteApi Invite API (on + accept only)
  * @property {() => { name?: string, deviceType?: string }} getDeviceInfo Our device info, shown to the invitor when they decide
  * @property {number} [defaultTimeout] Default timeout in ms for peer connection (default: 60_000)
+ * @property {number} [inviteTimeout] ms to wait for the Invite after admission (default: 30_000)
  * @property {Logger} [logger]
  */
 
@@ -105,6 +113,7 @@ export class InviteLinkJoiner extends TypedEmitter {
   #inviteApi
   #getDeviceInfo
   #defaultTimeout
+  #inviteTimeout
   #l
   /** @type {Map<string, PendingJoinRequest>} */
   #pending = new Map()
@@ -117,6 +126,7 @@ export class InviteLinkJoiner extends TypedEmitter {
     inviteApi,
     getDeviceInfo,
     defaultTimeout = 60_000,
+    inviteTimeout = INVITE_AFTER_ADMISSION_TIMEOUT_MS,
     logger,
   }) {
     super()
@@ -125,6 +135,7 @@ export class InviteLinkJoiner extends TypedEmitter {
     this.#inviteApi = inviteApi
     this.#getDeviceInfo = getDeviceInfo
     this.#defaultTimeout = defaultTimeout
+    this.#inviteTimeout = inviteTimeout
   }
 
   /**
@@ -220,7 +231,12 @@ export class InviteLinkJoiner extends TypedEmitter {
       )
       onClose.catch(noop)
 
-      const invite = await Promise.race([onInvited, onClose])
+      // An admitted peer that never receives the Invite (e.g. we were already
+      // a member and the invitor's RPC answered "already") must not wait
+      // forever
+      const invite = await timeoutPromise(Promise.race([onInvited, onClose]), {
+        milliseconds: this.#inviteTimeout,
+      })
 
       const projectId = await this.#inviteApi.accept(invite)
 
